@@ -24,20 +24,16 @@ if __name__ == "__main__":
     print(visible_list)
 
 
-    res = client.get_areas()
-
-    for id in res:
-
-        print(id.id, id.fanm, id.name, id.type, id.sim_type, id.nZoneType, id.nNum, id.nPoints, id.lonlat)
 
 
-    # 蓝军算法
+    # 蓝军算法 (已经设置好的不用管)
     combat_system = CombatSystem(client)
     # 蓝军算法启动
     combat_system.run_combat_loop()
 
     # ————————————————————主算法：—————————————————————————— #
     # 开始仿真
-    #client.set_multiple(10)
+    client.set_multiple(10)
     client.start()
-    #client.get_score()
+    client.set_multiple(10)
+    print(client.get_score())
