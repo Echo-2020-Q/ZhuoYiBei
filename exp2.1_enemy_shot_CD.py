@@ -1,14 +1,26 @@
 # 网络与方案初始化配置
+import rflysim
 from rflysim import RflysimEnvConfig, Position
 from rflysim.client import VehicleClient
 from BlueForce import CombatSystem
 import threading
 import time, re, threading
 
+DESTROYED_FLAG = "DAMAGE_STATE_DESTROYED"
 RED_IDS = [10091, 10084, 10085, 10086]
-AMMO_MAX = 8
-ATTACK_COOLDOWN_SEC = 3.0   # 同一红机连续下发攻击命令的最短间隔（避免刷命令）
+AMMO_MAX = 2
+ATTACK_COOLDOWN_SEC = 20.0   # 同一红机连续下发攻击命令的最短间隔（避免刷命令）
 SCAN_INTERVAL_SEC = 0.5     # 侦察扫描周期
+STATUS_POLL_MAX_TRIES = 10         # 轮询最多次数
+STATUS_POLL_INTERVAL = 0.25        # 每次轮询间隔(s)
+STATUS_POLL_BACKOFF = 1.5          # 退避倍率（可选）
+
+vel_0 = rflysim.Vel()
+vel_0.vz =150#飞行目标高度
+
+vel_0.rate = 100 # 速率
+
+vel_0.direct = 90 # 速度在地图内的绝对方向，正北为0，0-360表示完整一周的方向
 
 def _as_dict(obj):
     """把 track/pos 统一成 dict 读取（兼容属性对象 / dict）"""
@@ -150,19 +162,33 @@ class RedForceController:
         self.red_ids = set(int(x) for x in red_ids)
         self.ammo = {int(r): AMMO_MAX for r in red_ids}
         self.last_fire_time = {int(r): 0.0 for r in red_ids}
-        # 各红机当前锁定的目标，避免多次切换同一目标
-        self.assigned_target = {}
+        # 目标与并发控制
+        self.assigned_target = {}  # {red_id: target_id} 当前锁定
+        self.target_in_progress = set()  # 正在被某红机处理的目标（防多机同时打同一目标）
+        self.destroyed_targets = set()  # 已确认损毁的目标（来自 get_situ_info）
+        self.lock = threading.Lock()
 
-        # 开启红方雷达
+        # 开雷达 + 设速度（不做 get_command_status 轮询）
         for rid in red_ids:
             try:
                 uid = self.client.enable_radar(vehicle_id=rid, state=1)
-                print(f"[Red] Radar ON for {rid}, uuid={uid}")
+                print(f"[Red] Radar ON for {rid}, uid={uid}", flush=True)
             except Exception as e:
-                print(f"[Red] enable_radar({rid}) failed: {e}")
+                print(f"[Red] enable_radar({rid}) failed: {e}", flush=True)
+            try:
+                vuid = self.client.set_vehicle_vel(rid, vel_0)  # mode=0：航向+速度+高度
+                print(f"[Red] vel set for {rid}, uid={vuid}", flush=True)
+            except Exception as e:
+                print(f"[Red] set_vehicle_vel({rid}) failed: {e}", flush=True)
+
+        self.target_in_progress = set()  # 正在被某红机处理的目标，防多机浪费
+        self.destroyed_targets = set()  # 已确认损毁的目标
+        self.lock = threading.Lock()  # 线程锁，保护上面两个集合
+
+
+        # ---------- 工具 ---------- #
 
     def _distance_m(self, lon1, lat1, lon2, lat2):
-        """用官方静态方法计算两经纬点距离（米）；若无法获取，返回很大值"""
         if None in (lon1, lat1, lon2, lat2):
             return 1e18
         try:
@@ -170,105 +196,204 @@ class RedForceController:
             p2 = Position(x=lon2, y=lat2, z=0)
             return self.client.get_distance_by_lon_lat(p1, p2)
         except Exception:
-            # 兜底：粗略球面近似（不建议长期用）
             from math import cos, radians, sqrt
-            dx = (lon2 - lon1) * 111320.0 * cos(radians((lat1 + lat2)/2.0))
+            dx = (lon2 - lon1) * 111320.0 * cos(radians((lat1 + lat2) / 2.0))
             dy = (lat2 - lat1) * 110540.0
-            return sqrt(dx*dx + dy*dy)
+            return sqrt(dx * dx + dy * dy)
+
+    def _update_destroyed_from_situ(self):
+        """调用 get_situ_info()，把损毁目标加入 destroyed_targets，并释放占用。"""
+        try:
+            situ_raw = self.client.get_situ_info()
+        except Exception:
+            return
+        situ = self._normalize_situ(situ_raw)
+
+        to_mark_destroyed = []
+        for vid, info in situ.items():
+            if info and info.get("damage_state") == DESTROYED_FLAG:
+                to_mark_destroyed.append(vid)
+
+        if not to_mark_destroyed:
+            return
+
+        with self.lock:
+            for vid in to_mark_destroyed:
+                self.destroyed_targets.add(vid)
+                self.target_in_progress.discard(vid)
+                # 如果是我方红机损毁，也可以直接清零其弹药，避免后续逻辑再使用
+                if vid in self.ammo:
+                    self.ammo[vid] = 0
+
+    def _distance_m(self, lon1, lat1, lon2, lat2):
+        if None in (lon1, lat1, lon2, lat2):
+            return 1e18
+        try:
+            p1 = Position(x=lon1, y=lat1, z=0)
+            p2 = Position(x=lon2, y=lat2, z=0)
+            return self.client.get_distance_by_lon_lat(p1, p2)
+        except Exception:
+            from math import cos, radians, sqrt
+            dx = (lon2 - lon1) * 111320.0 * cos(radians((lat1 + lat2) / 2.0))
+            dy = (lat2 - lat1) * 110540.0
+            return sqrt(dx * dx + dy * dy)
+
+    def _normalize_situ(self, situ):
+        """
+        situ -> { id(int): {"side": str|None, "damage_state": str|None} }
+        """
+        out = {}
+        if not isinstance(situ, dict):
+            return out
+        for k, v in situ.items():
+            try:
+                key_id_guess = int(k)
+            except Exception:
+                key_id_guess = None
+            d = _as_dict(v)
+            vid = d.get("id", key_id_guess)
+            try:
+                vid = int(vid)
+            except Exception:
+                continue
+            side = d.get("side")
+            damage = d.get("damage_state")
+            out[vid] = {"side": side, "damage_state": damage}
+        return out
+
+    def _update_destroyed_from_situ(self):
+        """
+        以 get_situ_info() 为唯一真值来源：
+        - 标记所有 DAMAGE_STATE_DESTROYED 的载具为已损毁
+        - 释放其在 target_in_progress 中的占用
+        - 我方损毁则清零弹药，避免被错误分配
+        """
+        try:
+            situ_raw = self.client.get_situ_info()
+        except Exception:
+            return
+        situ = self._normalize_situ(situ_raw)
+        to_mark = [vid for vid, info in situ.items()
+                   if info and info.get("damage_state") == DESTROYED_FLAG]
+
+        if not to_mark:
+            return
+
+        with self.lock:
+            for vid in to_mark:
+                self.destroyed_targets.add(vid)
+                self.target_in_progress.discard(vid)
+                if vid in self.ammo:
+                    self.ammo[vid] = 0
 
     def _choose_nearest_target(self, red_id, tracks, all_pos):
-        """
-        给定某红机的可见 tracks 列表（已经标准化），结合当前所有载具位置，从中选最近的目标
-        返回 target_id 或 None
-        """
         if not tracks:
             return None
-
-        my_pos = all_pos.get(red_id, None)
+        my_pos = all_pos.get(red_id)
         if my_pos is None:
-            # 取不到位置时，退化：就选第一个
             return tracks[0]["target_id"]
-
         my_lon, my_lat = my_pos.x, my_pos.y
         best_tid, best_d = None, 1e18
         for t in tracks:
             tid = t["target_id"]
+            if tid in self.destroyed_targets:
+                continue
             lon, lat = t["lon"], t["lat"]
             d = self._distance_m(my_lon, my_lat, lon, lat)
             if d < best_d:
                 best_d, best_tid = d, tid
         return best_tid
-
+    # ---------- 主循环一步 ---------- #
     def step(self):
-        """执行一次扫描与火力控制"""
+        # 1) 感知
         try:
             raw_visible = self.client.get_visible_vehicles()
         except Exception as e:
-            print("[Red] get_visible_vehicles() failed:", e)
+            print("[Red] get_visible_vehicles() failed:", e, flush=True)
             return
 
         vis = normalize_visible(raw_visible)
-        #输出范围内的敌机
-        print(vis)
+        print("可见的目标：", vis)
         try:
             all_pos = self.client.get_vehicle_pos()  # {id: Position}
         except Exception:
             all_pos = {}
 
+        # 用态势信息刷新损毁集合（唯一来源）
+        self._update_destroyed_from_situ()
+
         now = time.time()
 
-        # 为避免多机过度集中同一目标，也可以做一个“已被锁定”的目标集合
-        already_targeted = set(self.assigned_target.values())
-
+        # 2) 决策 + 攻击（逐机）
         for red_id, tracks in vis.items():
-            # 只响应我们控制的红机
             if red_id not in self.red_ids:
                 continue
-
-            # 无弹药则跳过
             if self.ammo.get(red_id, 0) <= 0:
                 continue
-
-            # 没看到任何敌机
             if not tracks:
                 continue
 
-            # 目标选择：尽可能选最近的；若已有锁定目标且仍在可见列表，继续打原目标
-            keep_tid = self.assigned_target.get(red_id)
-            candidate_tids = [t["target_id"] for t in tracks if "target_id" in t]
-
-            if keep_tid in candidate_tids:
-                target_id = keep_tid
+            # 构造候选（距我升序），跳过已损毁
+            candidates = []
+            my_pos = all_pos.get(red_id)
+            if my_pos is not None:
+                my_lon, my_lat = my_pos.x, my_pos.y
+                for t in tracks:
+                    tid = t.get("target_id")
+                    if tid is None or tid in self.destroyed_targets:
+                        continue
+                    d = self._distance_m(my_lon, my_lat, t.get("lon"), t.get("lat"))
+                    candidates.append((d, tid))
             else:
-                target_id = self._choose_nearest_target(red_id, tracks, all_pos)
+                # 退化：用出现顺序代替距离
+                for idx, t in enumerate(tracks):
+                    tid = t.get("target_id")
+                    if tid is None or tid in self.destroyed_targets:
+                        continue
+                    candidates.append((idx, tid))
 
-            if target_id is None:
+            if not candidates:
                 continue
 
-            # 冷却限制，避免每个周期都下发命令
+            # 已锁定目标优先（仍可见且未损毁）
+            keep_tid = self.assigned_target.get(red_id)
+            still_visible_tids = {t.get("target_id") for t in tracks if t.get("target_id") is not None}
+            if keep_tid in still_visible_tids and keep_tid not in self.destroyed_targets:
+                candidates = [(-1.0, keep_tid)] + [(d, tid) for d, tid in candidates if tid != keep_tid]
+
+            # 冷却限制
             if (now - self.last_fire_time.get(red_id, 0.0)) < ATTACK_COOLDOWN_SEC:
                 continue
 
-            # 简单去重：如果别的红机已经在打这个目标，可以换第二近（可按需要保留/去掉）
-            if target_id in already_targeted and keep_tid != target_id:
-                # 挑选一个不同的目标（若有）
-                alt = [tid for tid in candidate_tids if tid not in already_targeted]
-                if alt:
-                    target_id = alt[0]
+            # 选第一个“未被其他红机占用”的目标（最近优先 -> 若最近被占则打第二近…）
+            target_id = None
+            with self.lock:
+                for _, tid in sorted(candidates, key=lambda x: x[0]):
+                    if tid not in self.target_in_progress and tid not in self.destroyed_targets:
+                        target_id = tid
+                        self.target_in_progress.add(tid)  # 立即占用（防并发撞车）
+                        break
+            if target_id is None:
+                continue
 
-            # 下发攻击命令
+            # 记录锁定
+            self.assigned_target[red_id] = target_id
+
+            # 3) 发射（不做命令状态轮询）
             try:
                 uid = self.client.set_target(vehicle_id=red_id, target_id=target_id)
-                print(f"[Red] {red_id} -> fire at {target_id}, order={uid}")
+                print(f"[Red] {red_id} -> fire at {target_id}, uid={uid}", flush=True)
                 self.ammo[red_id] -= 1
-                self.last_fire_time[red_id] = now
-                self.assigned_target[red_id] = target_id
-                already_targeted.add(target_id)
+                self.last_fire_time[red_id] = time.time()
             except Exception as e:
-                print(f"[Red] set_target({red_id},{target_id}) failed:", e)
+                print(f"[Red] set_target({red_id},{target_id}) failed: {e}", flush=True)
+                with self.lock:
+                    self.target_in_progress.discard(target_id)  # 失败释放占用
+                continue
+            # 不再开线程轮询；由 _update_destroyed_from_situ() 在后续扫描中判损毁
 
+    # ---------- 循环 ---------- #
     def run_loop(self, stop_when_paused=False):
-        """循环运行红方控制"""
         while True:
             try:
                 if stop_when_paused and self.client.is_pause():
@@ -293,7 +418,7 @@ if __name__ == "__main__":
     print("[Main] Blue combat loop started.", flush=True)
 
     # 2) 仿真控制
-    client.set_multiple(10)
+    #client.set_multiple(10)
     client.start()
 
     # 3) 红方控制：构造时会 enable_radar 并打印“Radar ON...”
@@ -306,10 +431,13 @@ if __name__ == "__main__":
     try:
         while True:
             time.sleep(2.0)
-            # 可选：周期性看分数
-            if print(client.get_score(), flush=True)== None:
-                None
-            else:
-                print(client.get_score(), flush=True)
+            # 周期性看分数
+            score = client.get_score()
+            if score is not None:
+                print("[Score]", score, flush=True)
+
+            # 可选：态势信息（量大时注释掉避免刷屏）
+            # situ = client.get_situ_info()
+            # print("[Situ]", situ, flush=True)
     except KeyboardInterrupt:
         print("[Main] Interrupted, exiting...", flush=True)

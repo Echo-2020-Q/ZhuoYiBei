@@ -27,9 +27,9 @@ if __name__ == "__main__":
 
 
     # 蓝军算法 (已经设置好的不用管)
-    combat_system = CombatSystem(client)
+    #combat_system = CombatSystem(client)
     # 蓝军算法启动
-    combat_system.run_combat_loop()
+    #combat_system.run_combat_loop()
 
     # ————————————————————主算法：—————————————————————————— #
     # 开始仿真
