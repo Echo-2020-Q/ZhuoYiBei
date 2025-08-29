@@ -8,21 +8,22 @@ import time, re, threading
 
 DESTROYED_FLAG = "DAMAGE_STATE_DESTROYED"
 RED_IDS = [10091, 10084, 10085, 10086]
-AMMO_MAX = 2
+AMMO_MAX = 8
 ATTACK_COOLDOWN_SEC = 2.0   # 同一红机连续下发攻击命令的最短间隔（避免刷命令）
 SCAN_INTERVAL_SEC = 0.1     # 侦察扫描周期
-LOCK_SEC = 20.0  # 每个目标的锁定时间窗口
+LOCK_SEC = 30.0  # 每个目标的锁定时间窗口
 BLUE_SIDE = 2       #蓝方的编号
 # 放在类里某处：枚举与判定
 BLUE_SIDE_CODE = 2           # 你的环境观测为 2=BLUE, 1=RED
-DESTROY_CODES   = {1}        # 你的环境观测为 1=DESTROYED
+DESTROY_CODES = {1}        # 你的环境观测为 1=DESTROYED
 
 vel_0 = rflysim.Vel()
 vel_0.vz = 150#飞行目标高度
 
-vel_0.rate = 100 # 速率
+vel_0.rate = 200 # 速率
 
 vel_0.direct = 90 # 速度在地图内的绝对方向，正北为0，0-360表示完整一周的方向
+
 last_step_time=0
 def _as_dict(obj):
     """把 track/pos 统一成 dict 读取（兼容属性对象 / dict）"""
@@ -200,7 +201,6 @@ class RedForceController:
         self.target_in_progress = set()  # 正在被某红机处理的目标，防多机浪费
         self.destroyed_targets = set()  # 已确认损毁的目标
         self.lock = threading.Lock()  # 线程锁，保护上面两个集合
-
 
         # ---------- 工具 ---------- #
 
