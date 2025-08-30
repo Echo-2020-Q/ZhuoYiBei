@@ -5,8 +5,24 @@
 - 写入一个 runs/<timestamp>/manifest.json 索引
 - 依赖：你上一版“完整整合”的脚本内容（类 RedForceController / RLRecorder / normalize_visible 等）
   本文件已内嵌必要代码（可独立运行）。
+  # -*- coding: utf-8 -*-
+# ================= RL 采样定义 =================
+# obs16:
+#  0-3 : 边界四距 (left, right, down, up)
+#  4-6 : vx, vy, vz
+#  7-10: 最近4个蓝机距离（不足补 BLUE_DIST_CAP）
+#  11  : 最近蓝机速度
+#  12  : 最近蓝机方向（deg, 0=北, 顺时针）
+#  13  : 到干扰区边界的有符号距离（外正内负）
+#  14  : 剩余攻击次数（ammo）
+#  15  : 水平速度标量（优先 vel.direct；否则 sqrt(vx^2+vy^2)）
+#
+# act4:
+#  0-2 : (rate, direct, vz) —— 最近1秒内下发的 vel 命令；没有则用实测兜底
+#  3   : 攻击标志（上一秒窗口内是否确认过一次“执行打击成功”）
 """
-
+# 给后端资源释放缓冲，加随机抖动更温和
+import random
 import os
 import csv
 import json
@@ -60,6 +76,24 @@ def _bearing_deg_from_A_to_B(lonA, latA, lonB, latB):
     x = math.cos(φ1)*math.sin(φ2) - math.sin(φ1)*math.cos(φ2)*math.cos(dλ)
     return (math.degrees(math.atan2(y, x)) + 360.0) % 360.0
 
+def _direct_rate_from_vx_vy(vx, vy):
+    """
+    从 (vx, vy) 反算:
+      - direct: 水平速度大小 (标量)
+      - rate  : 水平速度方向 (deg), 0=正北, 顺时针
+    文档约定: vx=正北分量, vy=正东方向分量
+    因此航向角=atan2(v_east, v_north) -> 度, 再规约到 [0, 360)
+    """
+    from math import sqrt, atan2, degrees
+    try:
+        vxn = float(vx) if vx is not None else 0.0
+        vye = float(vy) if vy is not None else 0.0
+    except Exception:
+        vxn, vye = 0.0, 0.0
+    direct = sqrt(vxn * vxn + vye * vye)
+    rate = (degrees(atan2(vye, vxn)) + 360.0) % 360.0
+    return direct, rate
+
 def _as_dict(obj):
     if obj is None:
         return {}
@@ -67,12 +101,14 @@ def _as_dict(obj):
         return obj
     out = {}
     for k in dir(obj):
-        if k.startswith('_'): continue
+        if k.startswith('_'):
+            continue
         try:
             v = getattr(obj, k)
         except Exception:
             continue
-        if callable(v): continue
+        if callable(v):
+            continue
         out[k] = v
     return out
 
@@ -120,9 +156,11 @@ def _signed_dist_to_jam_boundary_m(client, lon, lat):
     return d_c - JAM_RADIUS_M
 
 def _parse_track_from_string_rich(s):
-    if not isinstance(s, str): return None
+    if not isinstance(s, str):
+        return None
     m_id = re.search(r'\btarget_id\s*:\s*(\d+)', s) or re.search(r'\bid\s*:\s*(\d+)', s)
-    if not m_id: return None
+    if not m_id:
+        return None
     tid = int(m_id.group(1))
     m_xy = re.search(r'target\s*_?pos.*?\{[^}]*?x\s*:\s*([-\d\.eE]+)\s*[,， ]+\s*y\s*:\s*([-\d\.eE]+)', s) \
         or re.search(r'\bx\s*:\s*([-\d\.eE]+)\s*[，, ]+\s*y\s*:\s*([-\d\.eE]+)', s)
@@ -134,13 +172,15 @@ def _parse_track_from_string_rich(s):
     dire = float(m_dir.group(2)) if m_dir else None
     if dire is not None:
         dire = dire % 360.0
-        if dire < 0: dire += 360.0
+        if dire < 0:
+            dire += 360.0
     return {"target_id": tid, "lon": lon, "lat": lat, "speed": spd, "direction": dire}
 
 def _extract_track_fields_any(t_like):
     td = _as_dict(t_like)
     tid = td.get('target_id') or td.get('id')
-    if tid is None: return None
+    if tid is None:
+        return None
     tid = int(tid)
     pos  = td.get('target_pos') or td.get('target pos') or {}
     posd = _as_dict(pos)
@@ -148,13 +188,17 @@ def _extract_track_fields_any(t_like):
     spd  = td.get('target_speed') or td.get('speed')
     dire = td.get('target_direction') or td.get('target direction') or td.get('direction') or td.get('dir')
     try:
-        if spd is not None: spd  = float(spd)
-    except Exception: spd = None
+        if spd is not None:
+            spd  = float(spd)
+    except Exception:
+        spd = None
     try:
         if dire is not None:
             dire = float(dire) % 360.0
-            if dire < 0: dire += 360.0
-    except Exception: dire = None
+            if dire < 0:
+                dire += 360.0
+    except Exception:
+        dire = None
     return {"target_id": tid, "lon": lon, "lat": lat, "speed": spd, "direction": dire}
 
 def normalize_visible(visible):
@@ -162,8 +206,10 @@ def normalize_visible(visible):
     if not isinstance(visible, dict):
         return out
     for detector_id, v in visible.items():
-        try: detector_id = int(detector_id)
-        except Exception: pass
+        try:
+            detector_id = int(detector_id)
+        except Exception:
+            pass
         tracks = []
         if v is None:
             pass
@@ -173,18 +219,22 @@ def normalize_visible(visible):
                     item = _extract_track_fields_any(t)
                 else:
                     item = _parse_track_from_string_rich(t)
-                if item: tracks.append(item)
+                if item:
+                    tracks.append(item)
         elif isinstance(v, dict):
             if 'target_id' in v or 'id' in v:
                 item = _extract_track_fields_any(v)
-                if item: tracks.append(item)
+                if item:
+                    tracks.append(item)
             else:
                 for _, t in v.items():
                     item = _extract_track_fields_any(t)
-                    if item: tracks.append(item)
+                    if item:
+                        tracks.append(item)
         else:
-            item = _parse_track_from_string_rich(v);
-            if item: tracks.append(item)
+            item = _parse_track_from_string_rich(v)
+            if item:
+                tracks.append(item)
         out[int(detector_id)] = tracks
     return out
 
@@ -198,7 +248,7 @@ class RLRecorder:
         self.rows_for_csv = []
         self.latest_obs_vec = None
         self.latest_act_vec = None
-        self.has_dumped = False  # <<< 新增
+        self.has_dumped = False  # 只写一次
 
     def pack_single_obs16(self, client, rid, obs, boundary_rect, jam_signed_dist, blue4_dists,
                           nearest_blue_speed, nearest_blue_dir, vel_meas=None):
@@ -217,30 +267,52 @@ class RLRecorder:
             ammo if ammo is not None else 0
         ]
         if len(obs16) == 15:
-            speed_scalar = None
-            if vel_meas is not None:
-                speed_scalar = getattr(vel_meas, "direct", None)
-                if speed_scalar is None:
-                    from math import sqrt
-                    speed_scalar = sqrt(float(vx or 0.0)**2 + float(vy or 0.0)**2)
-            obs16.append(float(speed_scalar) if speed_scalar is not None else 0.0)
+            # 一律用 vx, vy 计算水平速度标量（不再信任 vel_meas.direct）
+            from math import sqrt
+            speed_scalar = sqrt(float(vx or 0.0) ** 2 + float(vy or 0.0) ** 2)
+            obs16.append(speed_scalar)
+
         return obs16
 
     def pack_single_act4(self, rid, sim_sec, vel_meas, pos_meas):
+        """
+        act4:
+          0: rate   (deg, 0=北, 顺时针)
+          1: direct (水平速度大小)
+          2: vz     (沿用旧逻辑: 优先命令缓存; 否则 pos_meas.z 作为“高度兜底”)
+          3: 攻击标志
+        说明:
+          - 若最近1秒内我们下发过 vel 命令, 则优先用命令(rate, direct, vz)
+          - 否则从实测 vel_meas.vx/vy 反算 (rate, direct), vz 仍按旧逻辑兜底
+        """
         vcmd = self.last_vel_cmd.get(int(rid))
-        if vcmd and (sim_sec - int(vcmd["t"])) <= 1:
-            rate = vcmd["rate"]; direct = vcmd["direct"]; vz = vcmd["vz"]
-        else:
-            rate = getattr(vel_meas, "rate", None)
-            direct = getattr(vel_meas, "direct", None)
-            vz = getattr(pos_meas, "z", None)
+
+        # 攻击标志（保持原样）
         att_times = self.attack_events.get(int(rid), [])
-        attack_flag = 1 if any((sim_sec-1) < t <= sim_sec for t in att_times) else 0
+        attack_flag = 1 if any((sim_sec - 1) < t <= sim_sec for t in att_times) else 0
 
         def nz(x, default):
-            try: return float(x)
-            except Exception: return default
-        return [nz(rate, 0.0), (nz(direct, 0.0) % 360.0), nz(vz, 0.0), int(attack_flag)]
+            try:
+                return float(x)
+            except Exception:
+                return default
+
+        if vcmd and (sim_sec - int(vcmd["t"])) <= 1:
+            # 最近 1 秒内有我们下发的命令 -> 直接用命令数值
+            rate_cmd = nz(vcmd.get("rate"), 0.0)
+            direct_cmd = nz(vcmd.get("direct"), 0.0)
+            vz_cmd = nz(vcmd.get("vz"), nz(getattr(pos_meas, "z", None), 0.0))
+            return [rate_cmd % 360.0, direct_cmd, vz_cmd, int(attack_flag)]
+
+        # 否则用实测 vx, vy 反算 rate/direct
+        vx = getattr(vel_meas, "vx", None) if vel_meas else None
+        vy = getattr(vel_meas, "vy", None) if vel_meas else None
+        direct_calc, rate_calc = _direct_rate_from_vx_vy(vx, vy)
+
+        # vz 仍按旧逻辑兜底（和你原来的数据对齐：没有命令就拿 pos_meas.z）
+        vz_fallback = nz(getattr(pos_meas, "z", None), 0.0)
+
+        return [rate_calc, direct_calc, vz_fallback, int(attack_flag)]
 
     def add_vector_row(self, sim_sec, obs_vec, act_vec):
         self.rows_for_csv.append([int(sim_sec)] + list(obs_vec) + list(act_vec))
@@ -268,11 +340,11 @@ class RLRecorder:
         self.buffer.append({"t": int(sim_sec), "red_id": int(red_id), "obs": obs_dict, "action": rec_action, "info": (extra_info or {})})
 
     def dump_csv(self, path):
-        if self.has_dumped:  # <<< 新增
+        if self.has_dumped:
             return
         if not self.rows_for_csv:
             print("[RL] No vector data to dump:", path, flush=True)
-            self.has_dumped = True  # 即便为空也标记，避免反复尝试
+            self.has_dumped = True
             return
         n_act = 16
         n_obs = len(self.rows_for_csv[0]) - 1 - n_act
@@ -280,11 +352,11 @@ class RLRecorder:
         abspath = os.path.abspath(path)
         os.makedirs(os.path.dirname(abspath), exist_ok=True)
         with open(abspath, "w", newline="", encoding="utf-8") as f:
-            w = csv.writer(f);
-            w.writerow(header);
+            w = csv.writer(f)
+            w.writerow(header)
             w.writerows(self.rows_for_csv)
         print(f"[RL] Dumped {len(self.rows_for_csv)} rows to {abspath}", flush=True)
-        self.has_dumped = True  # <<< 新增
+        self.has_dumped = True
 
 
 # ==================== 红方控制器（缩略自你上一版，逻辑一致） ====================
@@ -336,15 +408,21 @@ class RedForceController:
         return ("DESTROYED" in s.upper()) or (s.strip() == "1")
 
     def _is_fire_success(self, uid, max_tries=5, wait_s=0.1):
-        if not uid: return False
+        if not uid:
+            return False
         for _ in range(max_tries):
             time.sleep(wait_s)
-            try: st = self.client.get_command_status(uid)
-            except Exception: st = None
+            try:
+                st = self.client.get_command_status(uid)
+            except Exception:
+                st = None
             if isinstance(st, dict):
-                status = st.get('status', ''); result = st.get('execute_result', '') or ''
-                if status == 'EXECUTE_SUCCESS' or ('执行打击成功' in result): return True
-                if status == 'EXECUTE_FAILED': return False
+                status = st.get('status', '')
+                result = st.get('execute_result', '') or ''
+                if status == 'EXECUTE_SUCCESS' or ('执行打击成功' in result):
+                    return True
+                if status == 'EXECUTE_FAILED':
+                    return False
         return False
 
     def _fire_with_log(self, rid, tid):
@@ -354,7 +432,8 @@ class RedForceController:
         return uid
 
     def _distance_m(self, lon1, lat1, lon2, lat2):
-        if None in (lon1, lat1, lon2, lat2): return 1e18
+        if None in (lon1, lat1, lon2, lat2):
+            return 1e18
         try:
             p1 = Position(x=lon1, y=lat1, z=0); p2 = Position(x=lon2, y=lat2, z=0)
             return self.client.get_distance_by_lon_lat(p1, p2)
@@ -366,7 +445,8 @@ class RedForceController:
 
     def _get_target_pos(self, target_id, vis, all_pos):
         p = all_pos.get(target_id)
-        if p is not None: return p.x, p.y
+        if p is not None:
+            return p.x, p.y
         for tracks in vis.values():
             for t in tracks:
                 if t.get("target_id") == target_id:
@@ -376,8 +456,10 @@ class RedForceController:
     def _fetch_score_with_retry(self, tries=20, wait=0.2, where="(unknown)"):
         score_obj = None
         for _ in range(tries):
-            try: score_obj = self.client.get_score()
-            except Exception: score_obj = None
+            try:
+                score_obj = self.client.get_score()
+            except Exception:
+                score_obj = None
             if score_obj:
                 print(f"[Final Score {where}]", score_obj, flush=True)
                 return score_obj
@@ -386,9 +468,11 @@ class RedForceController:
         return None
 
     def _end_simulation_once(self, reason=""):
-        if self._ended: return
+        if self._ended:
+            return
         self._ended = True
-        if reason: print(f"[AutoStop] {reason}", flush=True)
+        if reason:
+            print(f"[AutoStop] {reason}", flush=True)
         self._fetch_score_with_retry(tries=5, wait=0.2, where="pre-stop")
         try:
             self.client.stop()
@@ -396,37 +480,47 @@ class RedForceController:
             print("[AutoStop] client.stop() failed:", e, flush=True)
         self._fetch_score_with_retry(tries=20, wait=0.2, where="post-stop")
         try:
-            self.recorder.dump_csv(self.out_csv_path)  # <<< 现在由 has_dumped 保证只写一次
+            self.recorder.dump_csv(self.out_csv_path)
         except Exception as e:
             print("[RL] dump_csv failed:", e, flush=True)
 
     def _update_destroyed_from_situ(self, force=False):
-        if self._ended: return
+        if self._ended:
+            return
         if not force:
             self._situ_counter = getattr(self, "_situ_counter", 0) + 1
-            if self._situ_counter % 5 != 0: return
-        try: situ_raw = self.client.get_situ_info() or {}
-        except Exception: return
+            if self._situ_counter % 5 != 0:
+                return
+        try:
+            situ_raw = self.client.get_situ_info() or {}
+        except Exception:
+            return
         any_new = False
         for vid, info in situ_raw.items():
-            if not info: continue
+            if not info:
+                continue
             side = getattr(info, "side", None) if not isinstance(info, dict) else info.get("side")
             dmg  = getattr(info, "damage_state", None) if not isinstance(info, dict) else info.get("damage_state")
             try:
                 vvid = getattr(info, "id", None)
-                if vvid is None and isinstance(info, dict): vvid = info.get("id")
-                if vvid is None: vvid = int(vid)
-                else: vvid = int(vvid)
+                if vvid is None and isinstance(info, dict):
+                    vvid = info.get("id")
+                if vvid is None:
+                    vvid = int(vid)
+                else:
+                    vvid = int(vvid)
             except Exception:
                 continue
-            if not self._is_destroyed_flag(dmg): continue
+            if not self._is_destroyed_flag(dmg):
+                continue
             if self._is_blue_side(side):
                 if vvid not in self.destroyed_blue:
                     self.destroyed_blue.add(vvid); self.destroyed_targets.add(vvid); any_new = True
             else:
                 if vvid not in self.destroyed_red:
                     self.destroyed_red.add(vvid); any_new = True
-                    if vvid in self.ammo: self.ammo[vvid] = 0
+                    if vvid in self.ammo:
+                        self.ammo[vvid] = 0
                     self.target_locks.pop(vvid, None)
         if any_new:
             print(f"[Situ] BLUE destroyed: {sorted(self.destroyed_blue)} | RED destroyed: {sorted(self.destroyed_red)}", flush=True)
@@ -437,23 +531,31 @@ class RedForceController:
 
     # ---- 主一步：先采样、再执行攻击逻辑 ----
     def step(self):
-        if self._ended: return
-        try: raw_visible = self.client.get_visible_vehicles()
+        if self._ended:
+            return
+        try:
+            raw_visible = self.client.get_visible_vehicles()
         except Exception as e:
             print("[Red] get_visible_vehicles() failed:", e, flush=True); return
         vis = normalize_visible(raw_visible)
-        try: all_pos = self.client.get_vehicle_pos()
-        except Exception: all_pos = {}
-        try: vel_all = self.client.get_vehicle_vel()
-        except Exception: vel_all = {}
+        try:
+            all_pos = self.client.get_vehicle_pos()
+        except Exception:
+            all_pos = {}
+        try:
+            vel_all = self.client.get_vehicle_vel()
+        except Exception:
+            vel_all = {}
 
         self._update_destroyed_from_situ()
         sim_t = self.client.get_sim_time()
         sim_sec = int(sim_t)
         self._score_counter = getattr(self, "_score_counter", 0) + 1
         if self._score_counter % 5 == 0:
-            try: self._score_cache = self.client.get_score() or None
-            except Exception: self._score_cache = None
+            try:
+                self._score_cache = self.client.get_score() or None
+            except Exception:
+                self._score_cache = None
 
         if sim_sec != getattr(self, "_last_logged_sec", -1):
             obs_concat = []; act_concat = []
@@ -465,23 +567,28 @@ class RedForceController:
                 dlist = []
                 for t in tracks:
                     lonB, latB = t.get("lon"), t.get("lat")
-                    if lonB is None or latB is None or my_lon is None or my_lat is None: continue
+                    if lonB is None or latB is None or my_lon is None or my_lat is None:
+                        continue
                     try:
                         d = self.client.get_distance_by_lon_lat(Position(x=my_lon, y=my_lat, z=0),
                                                                 Position(x=lonB, y=latB, z=0))
                     except Exception:
                         d = None
-                    if d is not None: dlist.append(float(d))
+                    if d is not None:
+                        dlist.append(float(d))
                 dlist.sort()
-                if len(dlist) < 4: dlist += [BLUE_DIST_CAP] * (4 - len(dlist))
-                else: dlist = dlist[:4]
+                if len(dlist) < 4:
+                    dlist += [BLUE_DIST_CAP] * (4 - len(dlist))
+                else:
+                    dlist = dlist[:4]
 
                 nb_speed, nb_dir = None, None
                 if tracks and my_lon is not None and my_lat is not None:
                     best, best_t = None, None
                     for t in tracks:
                         lonB, latB = t.get("lon"), t.get("lat")
-                        if lonB is None or latB is None: continue
+                        if lonB is None or latB is None:
+                            continue
                         try:
                             dd = self.client.get_distance_by_lon_lat(Position(x=my_lon, y=my_lat, z=0),
                                                                      Position(x=lonB, y=latB, z=0))
@@ -524,26 +631,33 @@ class RedForceController:
             self.recorder.add_vector_row(sim_sec, obs_concat, act_concat)
             self._last_logged_sec = sim_sec
 
-        if self._ended: return
+        if self._ended:
+            return
 
         # —— 执行攻击逻辑（与单轮版一致）——
-        try: raw_visible2 = self.client.get_visible_vehicles()
+        try:
+            raw_visible2 = self.client.get_visible_vehicles()
         except Exception as e:
             print("[Red] get_visible_vehicles() failed:", e, flush=True); return
         vis2 = normalize_visible(raw_visible2)
-        try: all_pos2 = self.client.get_vehicle_pos()
-        except Exception: all_pos2 = {}
+        try:
+            all_pos2 = self.client.get_vehicle_pos()
+        except Exception:
+            all_pos2 = {}
         self._update_destroyed_from_situ()
         now = self.client.get_sim_time()
         expired = [tid for tid, meta in self.target_locks.items() if now >= meta["until"]]
-        for tid in expired: self.target_locks.pop(tid, None)
+        for tid in expired:
+            self.target_locks.pop(tid, None)
 
         visible_blue_targets = set()
         for tracks in vis2.values():
             for t in tracks:
                 tid = t.get("target_id")
-                if tid is None or tid < 10000: continue
-                if tid in self.destroyed_targets or tid in self.target_locks: continue
+                if tid is None or tid < 10000:
+                    continue
+                if tid in self.destroyed_targets or tid in self.target_locks:
+                    continue
                 visible_blue_targets.add(tid)
 
         if visible_blue_targets != self._last_visible:
@@ -555,34 +669,46 @@ class RedForceController:
         if self.destroyed_targets != self._last_destroyed:
             print("已经被摧毁的目标:", self.destroyed_targets, flush=True)
             self._last_destroyed = set(self.destroyed_targets)
-        if not visible_blue_targets: return
+        if not visible_blue_targets:
+            return
 
         used_reds_this_round = set()
         assignments = []
         for tid in visible_blue_targets:
             t_lon, t_lat = self._get_target_pos(tid, vis2, all_pos2)
-            if t_lon is None or t_lat is None: continue
+            if t_lon is None or t_lat is None:
+                continue
             best_red, best_d = None, 1e18
             for rid in self.red_ids:
-                if rid in used_reds_this_round: continue
-                if rid in self.destroyed_targets: continue
-                if self.ammo.get(rid, 0) <= 0: continue
-                if (now - self.last_fire_time.get(rid, 0.0)) < ATTACK_COOLDOWN_SEC: continue
+                if rid in used_reds_this_round:
+                    continue
+                if rid in self.destroyed_targets:
+                    continue
+                if self.ammo.get(rid, 0) <= 0:
+                    continue
+                if (now - self.last_fire_time.get(rid, 0.0)) < ATTACK_COOLDOWN_SEC:
+                    continue
                 r_pos = all_pos2.get(rid)
-                if r_pos is None: continue
+                if r_pos is None:
+                    continue
                 d = self._distance_m(r_pos.x, r_pos.y, t_lon, t_lat)
-                if d < best_d: best_d, best_red = d, rid
+                if d < best_d:
+                    best_d, best_red = d, rid
             if best_red is not None:
                 assignments.append((best_red, tid))
                 used_reds_this_round.add(best_red)
 
-        if not assignments: return
+        if not assignments:
+            return
 
         for rid, tid in assignments:
-            if tid in self.destroyed_targets: continue
+            if tid in self.destroyed_targets:
+                continue
             now_sim = self.client.get_sim_time()
-            if (now_sim - self.last_fire_time.get(rid, 0.0)) < ATTACK_COOLDOWN_SEC: continue
-            if self.ammo.get(rid, 0) <= 0: continue
+            if (now_sim - self.last_fire_time.get(rid, 0.0)) < ATTACK_COOLDOWN_SEC:
+                continue
+            if self.ammo.get(rid, 0) <= 0:
+                continue
             try:
                 uid = self._fire_with_log(rid, tid)
                 print(f"[Red] {rid} -> fire at {tid}, uid={uid}", flush=True)
@@ -603,11 +729,14 @@ class RedForceController:
         start_t = time.time()
         try:
             while True:
-                if self._ended: break
+                if self._ended:
+                    break
                 if stop_when_paused:
                     try:
-                        if self.client.is_pause(): break
-                    except Exception: pass
+                        if self.client.is_pause():
+                            break
+                    except Exception:
+                        pass
                 if max_wall_time_sec is not None and (time.time() - start_t) > max_wall_time_sec:
                     print("[Red] Episode timeout reached, stopping...", flush=True)
                     self._end_simulation_once("Timeout")
@@ -620,13 +749,12 @@ class RedForceController:
             except Exception as e:
                 print("[RL] dump_csv on finally failed:", e, flush=True)
 
-# ==================== 多轮批量 Runner ====================
+# ==================== 多轮批量 Runner（改动点 1：safe_reset 幂等、只复位一次） ====================
 def safe_reset(client):
     """
-    优先使用 reset/restart 之一；若都没有，再用 stop()->sleep()->start() 兜底。
-    注意：只做一种操作，避免 '容器正在运行' 冲突。
+    只尝试一次“原生复位/重启”，成功后立刻返回 True；不在此处做额外 start()。
+    若均不可用，再 fallback 为 stop()->sleep->start()，其中 start() 报“容器正在运行”也视为成功。
     """
-    # 优先原生重置：restart / reset / reset_scene / reset_scenario
     for fn_name in ["restart", "reset", "reset_scene", "reset_scenario"]:
         fn = getattr(client, fn_name, None)
         if callable(fn):
@@ -635,16 +763,14 @@ def safe_reset(client):
                 print(f"[Runner] client.{fn_name}() called.", flush=True)
                 return True
             except Exception as e:
-                # 容器正在运行 -> 说明不需要重复启动，直接当作 ok 进入下一步
                 msg = str(e)
                 if "容器正在运行" in msg or "already running" in msg.lower():
                     print(f"[Runner] client.{fn_name}(): container already running, continue.", flush=True)
                     return True
                 print(f"[Runner] client.{fn_name}() failed: {e}", flush=True)
-                # 尝试下一个候选
                 continue
 
-    # 都没有就硬重启
+    # 硬重启兜底
     try:
         client.stop()
     except Exception:
@@ -655,7 +781,6 @@ def safe_reset(client):
         print("[Runner] fallback stop()->start() used.", flush=True)
         return True
     except Exception as e:
-        # 若此处提示“容器正在运行”，说明其实启动着，也当成功
         msg = str(e)
         if "容器正在运行" in msg or "already running" in msg.lower():
             print("[Runner] fallback start(): container already running, continue.", flush=True)
@@ -663,9 +788,13 @@ def safe_reset(client):
         print("[Runner] fallback start failed:", e, flush=True)
         return False
 
-
+# ==================== 改动点 2：run_one_episode 统一整轮并返回 (success, score) ====================
 def run_one_episode(client, plan_id, out_csv_path, max_wall_time_sec=360, min_wall_time_sec=10):
-    # 先确保停一下，避免上一轮残留
+    """
+    执行一整轮并返回 (success: bool, score_obj: dict|None)
+    统一在这里做：预停 -> 复位 -> 启动蓝军/红军线程 -> 等待结束/超时 -> 停止 -> 拉取分数 -> 落盘
+    """
+    # 预停（忽略失败）
     try:
         client.stop()
         print("[Runner] pre-episode stop()", flush=True)
@@ -673,52 +802,75 @@ def run_one_episode(client, plan_id, out_csv_path, max_wall_time_sec=360, min_wa
         pass
     time.sleep(0.5)
 
-    # === 先 reset / start 场景 ===
+    # 复位（只做一次）
     ok = safe_reset(client)
     if not ok:
+        print("[Runner] safe_reset failed; give up this episode.", flush=True)
+        return False, None
+
+    # === 启动蓝军线程（时序关键：场景已在运行态） ===
+    def _blue_wrapper():
+        try:
+            blue = CombatSystem(client)
+            blue.run_combat_loop()
+        except Exception as e:
+            print("[Runner] Blue loop exception:", e, flush=True)
+
+    blue_thread = threading.Thread(target=_blue_wrapper, daemon=True)
+    blue_thread.start()
+    print("[Runner] Blue loop started.", flush=True)
+
+    # === 启动红军控制线程 ===
+    red_ctrl = RedForceController(client, RED_IDS, out_csv_path)
+    red_thread = threading.Thread(
+        target=lambda: red_ctrl.run_loop(max_wall_time_sec=max_wall_time_sec),
+        daemon=True
+    )
+    red_thread.start()
+    print("[Runner] Red loop started.", flush=True)
+
+    # === 等待结束条件 ===
+    t0 = time.time()
+    success = False
+    score_obj = None
+
+    try:
+        # 轮询等待：红控在“全灭/超时”内会自结束并 dump
+        while True:
+            if not red_thread.is_alive():
+                success = True
+                break
+
+            if (time.time() - t0) > max_wall_time_sec:
+                print("[Runner] Episode timeout reached, stopping...", flush=True)
+                try:
+                    client.stop()
+                except Exception:
+                    pass
+                break
+
+            time.sleep(0.5)
+    finally:
+        # 统一收尾
         try:
             client.stop()
         except Exception:
             pass
-        time.sleep(1.0)
+        # 拉分：多试几次（仿真刚停可能分数未刷新）
         try:
-            client.start()
-            ok = True
-            print("[Runner] start() after second try.", flush=True)
-        except Exception as e:
-            msg = str(e)
-            if "容器正在运行" in msg or "already running" in msg.lower():
-                ok = True
-                print("[Runner] start(): container already running, continue.", flush=True)
-            else:
-                print("[Runner] start() failed:", e, flush=True)
+            if hasattr(red_ctrl, "_fetch_score_with_retry"):
+                score_obj = red_ctrl._fetch_score_with_retry(tries=10, wait=0.2, where="runner-final")
+        except Exception:
+            score_obj = None
 
-    # 再做一次幂等 start（如已运行会被忽略）
-    if ok:
-        try:
-            client.start()
-            print("[Runner] client.start() (idempotent).", flush=True)
-        except Exception as e:
-            msg = str(e)
-            if "容器正在运行" in msg or "already running" in msg.lower():
-                pass
-            else:
-                print("[Runner] extra start() failed (ignored):", e, flush=True)
+        wall = time.time() - t0
+        if wall < min_wall_time_sec:
+            success = False
+            print(f"[Runner] Episode too short ({wall:.1f}s) -> mark as failed.", flush=True)
 
-    # === 在场景已运行后，再启动蓝军线程（关键：时序） ===
-    blue = CombatSystem(client)
-    blue_thread = threading.Thread(target=blue.run_combat_loop, daemon=True)
-    blue_thread.start()
-    print("[Runner] Blue loop started.", flush=True)
+    return success, score_obj
 
-    # 红方控制器
-    red_ctrl = RedForceController(client, RED_IDS, out_csv_path)
-    red_thread = threading.Thread(target=lambda: red_ctrl.run_loop(max_wall_time_sec=max_wall_time_sec), daemon=True)
-    red_thread.start()
-    print("[Runner] Red loop started.", flush=True)
-
-
-
+# ==================== 改动点 3：main 精简每轮流程（不再二次 reset/start） ====================
 def main():
     # === 可调参数 ===
     EPISODES = 1000
@@ -742,17 +894,12 @@ def main():
 
     for ep in range(1, EPISODES + 1):
         print(f"\n[Runner] ===== Episode {ep}/{EPISODES} =====", flush=True)
-        # 场景复位
-        ok = safe_reset(client)
-        if not ok:
-            print("[Runner] reset failed; sleep and try start()", flush=True)
-            time.sleep(1.0)
-            try: client.start()
-            except Exception as e:
-                print("[Runner] start after reset failed:", e, flush=True)
 
         out_csv = os.path.join(out_root, f"ep_{ep:04d}.csv")
-        success, score = run_one_episode(client, PLAN_ID, out_csv, MAX_WALL_TIME_PER_EP, MIN_WALL_TIME_PER_EP)
+        success, score = run_one_episode(
+            client, PLAN_ID, out_csv,
+            MAX_WALL_TIME_PER_EP, MIN_WALL_TIME_PER_EP
+        )
 
         manifest["episodes"].append({
             "episode": ep,
@@ -761,8 +908,8 @@ def main():
             "score": score
         })
 
-        # 小憩一下再下一轮，避免端上资源未释放完
-        time.sleep(1.0)
+        # 给后端 资源释放 缓冲（稍长一点更稳）
+        time.sleep(2.0 + random.uniform(0.0, 2.0))
 
     # 写索引文件
     manifest_path = os.path.join(out_root, "manifest.json")
