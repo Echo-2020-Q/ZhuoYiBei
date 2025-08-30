@@ -76,6 +76,22 @@ def _bearing_deg_from_A_to_B(lonA, latA, lonB, latB):
     x = math.cos(φ1)*math.sin(φ2) - math.sin(φ1)*math.cos(φ2)*math.cos(dλ)
     return (math.degrees(math.atan2(y, x)) + 360.0) % 360.0
 
+def _geo_dist_haversine_m(lon1, lat1, lon2, lat2):
+    """
+    以经纬度计算两点大圆距离（单位: m），不再依赖 sim 的距离接口。
+    """
+    import math
+    if None in (lon1, lat1, lon2, lat2):
+        return None
+    R = 6371000.0  # 地球半径 (m)
+    φ1, φ2 = math.radians(lat1), math.radians(lat2)
+    dφ = math.radians(lat2 - lat1)
+    dλ = math.radians(lon2 - lon1)
+    a = math.sin(dφ/2)**2 + math.cos(φ1)*math.cos(φ2)*math.sin(dλ/2)**2
+    c = 2 * math.atan2(math.sqrt(a), math.sqrt(1-a))
+    return R * c
+
+
 def _direct_rate_from_vx_vy(vx, vy):
     """
     从 (vx, vy) 反算:
@@ -93,6 +109,26 @@ def _direct_rate_from_vx_vy(vx, vy):
     direct = sqrt(vxn * vxn + vye * vye)
     rate = (degrees(atan2(vye, vxn)) + 360.0) % 360.0
     return direct, rate
+
+def _ang_norm(deg):
+    return (float(deg) + 360.0) % 360.0
+
+def _ang_diff_abs(a, b):
+    """返回最小夹角绝对值 [0, 180]"""
+    d = abs(_ang_norm(a) - _ang_norm(b))
+    return d if d <= 180.0 else 360.0 - d
+
+def _bearing_deg_A_to_B(lonA, latA, lonB, latB):
+    # 与 _bearing_deg_from_A_to_B 一样，这里提供一个更短名包装，方便调用
+    return _bearing_deg_from_A_to_B(lonA, latA, lonB, latB)
+
+def _is_missile_track(tid):
+    """ 导弹 ID 规则：< 10000 """
+    try:
+        return int(tid) < 10000
+    except Exception:
+        return False
+
 
 def _as_dict(obj):
     if obj is None:
@@ -382,6 +418,32 @@ class RedForceController:
         self._score_cache = None
         self._score_counter = 0
         self.out_csv_path = out_csv_path
+        # --- 调试/打印控制导弹的轨迹 ---
+        self.DEBUG_EVADE = True
+        self.MISSILE_DEBUG_PRINT_INTERVAL = 0.5  # 每架红机最小打印间隔（秒）
+        self._last_debug_print = {}              # rid -> 上次打印墙钟时间
+        self._last_approach_flag = {}           # rid -> 上次是否判定为“接近”
+
+        # --- 躲避导弹相关常量 ---
+        self.MISSILE_THREAT_DIST_M = 30000.0      # 威胁距离阈值
+        self.MISSILE_BEARING_THRESH_DEG = 35.0   # 视线角阈值：导弹航向与“导弹->红机连线”夹角小于该值视为“冲向我”
+        self.EVASIVE_TURN_DEG = 90.0             # 机动：相对导弹方向 90°
+        self.EVASIVE_SPEED_MIN = 220.0           # 躲避时最低水平速度（m/s），会与当前速度取 max
+        self.EVASIVE_DURATION_SEC = 10.0          # 每次躲避持续时长（限制攻击）
+        self.EVASIVE_COOLDOWN_SEC = 5.0          # 躲避冷却：避免频繁反复机动
+
+        # --- 躲避导弹状态 ---
+        self._missile_last_dist = {}             # key=(rid, mid) -> 上次测得距离（米）
+        # --- 导弹轨迹缓存：mid -> {"lon": float, "lat": float, "t": float}
+        self._missile_last = {}
+        self._evasive_until = {}                 # rid -> 时间戳（在此之前禁止开火）
+        self._last_evasive_time = {}             # rid -> 最近一次触发躲避的时间戳
+
+        # --- 全灭后延迟结束（20s） ---
+        self._end_grace_until = None   # None 或 墙钟时间戳（time.time()）
+        self._end_reason = ""
+
+
 
         for rid in red_ids:
             try:
@@ -398,6 +460,27 @@ class RedForceController:
                 print(f"[Red] set_vehicle_vel({rid}) failed: {e}", flush=True)
 
     # ---- 内部工具 ----
+    def _estimate_msl_heading_speed(self, mid, lon_now, lat_now, t_now):
+        """
+        基于上一次缓存位置，估计导弹航向(度，0北顺时针) 与 地速(m/s)。
+        如果没有历史点或 dt 太小，返回 (None, None)，并只更新缓存。
+        """
+        prev = self._missile_last.get(int(mid))
+        self._missile_last[int(mid)] = {"lon": float(lon_now), "lat": float(lat_now), "t": float(t_now)}
+        if not prev:
+            return (None, None)
+
+        dt = float(t_now) - float(prev["t"])
+        if dt <= 1e-3:
+            return (None, None)
+
+        # 航向：上一点 -> 当前点
+        mdir = _bearing_deg_from_A_to_B(prev["lon"], prev["lat"], lon_now, lat_now)  # deg
+        # 地速：两点大圆距离 / dt
+        dist = _geo_dist_haversine_m(prev["lon"], prev["lat"], lon_now, lat_now) or 0.0
+        mspeed = dist / dt  # m/s
+        return (mdir, mspeed)
+
     def _is_blue_side(self, side):
         return side in (2, "SIDE_BLUE", "BLUE")
 
@@ -432,16 +515,8 @@ class RedForceController:
         return uid
 
     def _distance_m(self, lon1, lat1, lon2, lat2):
-        if None in (lon1, lat1, lon2, lat2):
-            return 1e18
-        try:
-            p1 = Position(x=lon1, y=lat1, z=0); p2 = Position(x=lon2, y=lat2, z=0)
-            return self.client.get_distance_by_lon_lat(p1, p2)
-        except Exception:
-            from math import cos, radians, sqrt
-            dx = (lon2-lon1) * 111320.0 * cos(radians((lat1+lat2)/2.0))
-            dy = (lat2-lat1) * 110540.0
-            return sqrt(dx*dx + dy*dy)
+        d = _geo_dist_haversine_m(lon1, lat1, lon2, lat2)
+        return float(d) if d is not None else 1e18
 
     def _get_target_pos(self, target_id, vis, all_pos):
         p = all_pos.get(target_id)
@@ -524,10 +599,26 @@ class RedForceController:
                     self.target_locks.pop(vvid, None)
         if any_new:
             print(f"[Situ] BLUE destroyed: {sorted(self.destroyed_blue)} | RED destroyed: {sorted(self.destroyed_red)}", flush=True)
-        if len(self.destroyed_blue) >= 4:
-            self._end_simulation_once("All 4 BLUE aircraft destroyed."); return
-        if len(self.destroyed_red) >= 4:
-            self._end_simulation_once("All 4 RED aircraft destroyed."); return
+        # === 全灭后延迟 20s 才真正结束 ===
+        import time as _time
+        now_wall = _time.time()
+
+        # 首次触发：设置 20s 优雅收尾窗口
+        if (len(self.destroyed_blue) >= 4 or len(self.destroyed_red) >= 4) and self._end_grace_until is None:
+            if len(self.destroyed_blue) >= 4:
+                self._end_reason = "All 4 BLUE aircraft destroyed."
+            else:
+                self._end_reason = "All 4 RED aircraft destroyed."
+            self._end_grace_until = now_wall + 20.0
+            print(f"[Grace] {self._end_reason} Ending in 20s...", flush=True)
+            return  # 本次先不结束，等下次再检查是否到时
+
+        # 已经在优雅收尾窗口中：到点就结束
+        if self._end_grace_until is not None:
+            if now_wall >= self._end_grace_until:
+                self._end_simulation_once(self._end_reason)
+            # 不到点就什么也不做，让主循环继续
+
 
     # ---- 主一步：先采样、再执行攻击逻辑 ----
     def step(self):
@@ -634,11 +725,13 @@ class RedForceController:
         if self._ended:
             return
 
+
         # —— 执行攻击逻辑（与单轮版一致）——
         try:
             raw_visible2 = self.client.get_visible_vehicles()
         except Exception as e:
-            print("[Red] get_visible_vehicles() failed:", e, flush=True); return
+            print("[Red] get_visible_vehicles() failed:", e, flush=True);
+            return
         vis2 = normalize_visible(raw_visible2)
         try:
             all_pos2 = self.client.get_vehicle_pos()
@@ -646,10 +739,271 @@ class RedForceController:
             all_pos2 = {}
         self._update_destroyed_from_situ()
         now = self.client.get_sim_time()
+
+        # 导弹方向兜底所需：拿到所有载具（含导弹）的实测速度
+        try:
+            vel_all2 = self.client.get_vehicle_vel()
+        except Exception:
+            vel_all2 = {}
+
+        # ===== 调试：导弹原始信息表（每秒一次）=====
+        if not hasattr(self, "_last_raw_msl_print_sec"):
+            self._last_raw_msl_print_sec = -1
+        if sim_sec != self._last_raw_msl_print_sec:
+            self._last_raw_msl_print_sec = sim_sec
+            try:
+                # 收集导弹：从 all_pos2 或可见表里提取 <10000 的 id
+                missile_ids = set()
+                for vid in (all_pos2 or {}):
+                    try:
+                        if int(vid) < 10000:
+                            missile_ids.add(int(vid))
+                    except Exception:
+                        pass
+                for tracks in (vis2 or {}).values():
+                    for t in (tracks or []):
+                        tid = t.get("target_id")
+                        if tid is not None and int(tid) < 10000:
+                            missile_ids.add(int(tid))
+
+                if missile_ids:
+                    print("[RAW MISSILES @{}] ids={}".format(sim_sec, sorted(missile_ids)), flush=True)
+                    for mid in sorted(missile_ids):
+                        mpos = all_pos2.get(mid)
+                        mm = vel_all2.get(mid) if vel_all2 else None
+                        # 原始 track（从各红机视角里挑一条有该 mid 的，打印原样）
+                        raw_track = None
+                        for det_id, tracks in (raw_visible2 or {}).items():
+                            if isinstance(tracks, list):
+                                for item in tracks:
+                                    td = _as_dict(item)
+                                    if int(td.get("target_id", -1)) == int(mid):
+                                        raw_track = td
+                                        break
+                            elif isinstance(tracks, dict):
+                                for _, item in tracks.items():
+                                    td = _as_dict(item)
+                                    if int(td.get("target_id", -1)) == int(mid):
+                                        raw_track = td
+                                        break
+                            if raw_track:
+                                break
+
+                        # 打印一行：原始 track、位置、速度（vx/vy/vz & 直读的 direct/rate）
+                        print(
+                            "[RAW] mid={} track={} pos=({:.6f},{:.6f}) vel={{vx:{}, vy:{}, vz:{}, direct:{}, rate:{}}}".format(
+                                mid,
+                                raw_track,
+                                getattr(mpos, "x", float("nan")) if mpos else float("nan"),
+                                getattr(mpos, "y", float("nan")) if mpos else float("nan"),
+                                getattr(mm, "vx", None) if mm else None,
+                                getattr(mm, "vy", None) if mm else None,
+                                getattr(mm, "vz", None) if mm else None,
+                                getattr(mm, "direct", None) if mm else None,
+                                getattr(mm, "rate", None) if mm else None
+                            ),
+                            flush=True
+                        )
+            except Exception as e:
+                print("[RAW MISSILES] dump failed:", e, flush=True)
+
+        # 清理过期锁
         expired = [tid for tid, meta in self.target_locks.items() if now >= meta["until"]]
         for tid in expired:
             self.target_locks.pop(tid, None)
 
+        # === Missile Evasion: 识别导弹 & 判定威胁 & 触发躲避（含调试打印）===
+        # === Missile Evasion: 识别导弹 & 判定威胁 & 触发躲避（含详细调试打印）===
+        # 说明：
+        # - mdir：用导弹上一帧与当前帧位置的方位角(北=0°, 顺时针)估算
+        # - 最近红机：对每一枚导弹，找距它最近的红机 rid_near
+        # - 然后对每一架红机 rid，再找离它最近的一枚导弹做威胁判定（保持你现有的“每红机只处理一枚最近导弹”的结构）
+        # - 打印项包含：最近红机ID、mdir、los_m2red、ang_diff、approach、threat、cooldown_ok、evading_now、reason
+
+        # 1) 先收集所有“看上去是导弹”的目标（<10000）
+        if not hasattr(self, "_missile_prev_xy"):
+            self._missile_prev_xy = {}  # mid -> (lon, lat) 用于推算导弹朝向
+        missiles = []  # list of dict(mid, lon, lat, mspeed, mdir)
+
+        for tracks in vis2.values():
+            for t in tracks:
+                tid = t.get("target_id")
+                if not _is_missile_track(tid):
+                    continue
+                mid = int(tid)
+
+                # 位置：优先 get_vehicle_pos；没有就用 track 里的 target_pos
+                mpos = all_pos2.get(mid)
+                if mpos and getattr(mpos, "x", None) is not None and getattr(mpos, "y", None) is not None:
+                    mlon, mlat = float(mpos.x), float(mpos.y)
+                else:
+                    mlon = t.get("lon");
+                    mlat = t.get("lat")
+
+                if mlon is None or mlat is None:
+                    continue
+
+                # 用上一帧位置估算导弹自身航向角 mdir
+                prev = self._missile_prev_xy.get(mid)
+                mdir = None
+                if prev and prev[0] is not None and prev[1] is not None:
+                    mdir = _bearing_deg_from_A_to_B(prev[0], prev[1], mlon, mlat)
+                self._missile_prev_xy[mid] = (mlon, mlat)
+
+                missiles.append({
+                    "mid": mid,
+                    "lon": mlon,
+                    "lat": mlat,
+                    "mspeed": t.get("speed"),  # 雷达报的速度标量（如有）
+                    "mdir": mdir  # 我们根据连续位置推算的导弹朝向角
+                })
+
+        # 2) 为每枚导弹找“最近红机”，便于打印你要的“最近红方无人机ID”
+        nearest_red_of_missile = {}  # mid -> (rid_near, dist_m)
+        if missiles:
+            for m in missiles:
+                mid, mlon, mlat = m["mid"], m["lon"], m["lat"]
+                rid_near, d_near = None, None
+                for rid in self.red_ids:
+                    rp = all_pos2.get(rid)
+                    if not rp or getattr(rp, "x", None) is None or getattr(rp, "y", None) is None:
+                        continue
+                    rlon, rlat = float(rp.x), float(rp.y)
+                    d = _geo_dist_haversine_m(mlon, mlat, rlon, rlat)
+                    if d is None:
+                        continue
+                    if d_near is None or d < d_near:
+                        rid_near, d_near = rid, float(d)
+                if rid_near is not None:
+                    nearest_red_of_missile[mid] = (rid_near, d_near)
+
+        # 3) 逐红机：挑离它最近的一枚导弹，完成威胁判定 + 打印
+        if missiles:
+            now_sim = self.client.get_sim_time()  # 用仿真时钟判定“机动窗口”
+            now_wall = time.time()  # 用墙钟判定“冷却时间”
+            for rid in sorted(self.red_ids):
+                my_p = all_pos2.get(rid)
+                if not my_p or getattr(my_p, "x", None) is None or getattr(my_p, "y", None) is None:
+                    continue
+                my_lon, my_lat = float(my_p.x), float(my_p.y)
+
+                # 找“对这架红机来说最近”的导弹
+                best_mid, best_dist, best_meta = None, None, None
+                for m in missiles:
+                    d = _geo_dist_haversine_m(m["lon"], m["lat"], my_lon, my_lat)
+                    if d is None:
+                        continue
+                    if best_dist is None or d < best_dist:
+                        best_mid, best_dist, best_meta = m["mid"], float(d), m
+                if best_mid is None:
+                    continue
+
+                # 计算导弹->红机的视线角、夹角与“逼近”判定
+                mdir = best_meta.get("mdir")  # 可能为 None（刚出现或位置没变化）
+                los_m2red = _bearing_deg_from_A_to_B(best_meta["lon"], best_meta["lat"], my_lon, my_lat)
+                ang_diff = _ang_diff_abs(mdir, los_m2red) if (mdir is not None and los_m2red is not None) else None
+
+                approach_ok = False
+                reason = "unknown"
+                if ang_diff is not None:
+                    if ang_diff <= self.MISSILE_BEARING_THRESH_DEG:
+                        approach_ok = True
+                        reason = f"angle_ok({ang_diff:.1f}<= {self.MISSILE_BEARING_THRESH_DEG})"
+                    else:
+                        reason = f"angle_large({ang_diff:.1f})"
+                else:
+                    # 仅用距离趋势兜底（记录每红机-导弹对的上次距离）
+                    key = (rid, best_mid, "dist")
+                    last_d = self._missile_last_dist.get(key, None)
+                    if last_d is not None and best_dist < last_d:
+                        approach_ok = True
+                        reason = "dist_decreasing"
+                    else:
+                        reason = "no_dir_and_no_decrease"
+                    self._missile_last_dist[key] = best_dist
+
+                # 威胁范围、冷却、是否在躲避窗口
+                in_threat = (best_dist is not None and best_dist <= self.MISSILE_THREAT_DIST_M)
+                last_ev = self._last_evasive_time.get(rid, -1e9)
+                cooldown_ok = (now_wall - last_ev) >= self.EVASIVE_COOLDOWN_SEC
+                in_evasive_window = (self._evasive_until.get(rid, 0.0) > now_sim)
+
+                # 最近红机（从“导弹视角”）是谁
+                rid_near, d_near = nearest_red_of_missile.get(best_mid, (None, None))
+
+                # === 统一详细打印（带你要的全部字段） ===
+                if self.DEBUG_EVADE:
+                    dist_str = f"{best_dist:.0f}" if best_dist is not None else "-"
+                    mdir_str = f"{mdir:.1f}" if mdir is not None else "None"
+                    los_str = f"{los_m2red:.1f}" if los_m2red is not None else "None"
+                    ang_str = f"{ang_diff:.1f}" if ang_diff is not None else "None"
+                    rid_near_str = f"{rid_near}" if rid_near is not None else "None"
+                    d_near_str = f"{d_near:.0f}" if d_near is not None else "None"
+                    ms = best_meta.get("mspeed")
+                    mspeed_str = f"{ms:.1f}" if ms is not None else "None"
+
+                    # 节流：每架红机 0.5s 打印一次，或者“approach”翻转时立即打印
+                    lp = self._last_debug_print.get(rid, 0.0)
+                    flip = (self._last_approach_flag.get(rid) != approach_ok)
+                    if (now_wall - lp) >= self.MISSILE_DEBUG_PRINT_INTERVAL or flip:
+                        self._last_debug_print[rid] = now_wall
+                        self._last_approach_flag[rid] = approach_ok
+                        print(
+                            f"[MISSILE] rid={rid} mid={best_mid} "
+                            f"dist={dist_str}m mspeed={mspeed_str}m/s "
+                            f"nearest_red_of_missile={rid_near_str}@{d_near_str}m "
+                            f"mdir={mdir_str}° los_m2red={los_str}° ang_diff={ang_str} "
+                            f"approach={approach_ok} threat={in_threat} "
+                            f"cooldown_ok={cooldown_ok} evading_now={in_evasive_window} "
+                            f"reason={reason}",
+                            flush=True
+                        )
+
+                # 触发条件：威胁距离 + 接近 + 冷却满足
+                if in_threat and approach_ok and cooldown_ok:
+                    use_mdir = mdir if mdir is not None else (los_m2red or 0.0)
+                    cand1 = _ang_norm(use_mdir + self.EVASIVE_TURN_DEG)
+                    cand2 = _ang_norm(use_mdir - self.EVASIVE_TURN_DEG)
+                    los_red2m = _bearing_deg_from_A_to_B(my_lon, my_lat, best_meta["lon"], best_meta["lat"])
+                    away_dir = _ang_norm(los_red2m + 180.0) if los_red2m is not None else None
+                    if away_dir is not None:
+                        # 选更背离导弹的 90° 候选
+                        score1 = _ang_diff_abs(cand1, away_dir)
+                        score2 = _ang_diff_abs(cand2, away_dir)
+                        evade_heading = cand1 if score1 >= score2 else cand2
+                    else:
+                        evade_heading = cand1
+
+                    # 水平速度：max(当前, 最小)
+                    v_me = vel_all2.get(rid) if vel_all2 else None
+                    v_direct_now, _ = _direct_rate_from_vx_vy(
+                        getattr(v_me, "vx", 0.0) if v_me else 0.0,
+                        getattr(v_me, "vy", 0.0) if v_me else 0.0
+                    )
+                    v_direct_cmd = max(float(v_direct_now or 0.0), self.EVASIVE_SPEED_MIN)
+                    vz_keep = getattr(v_me, "vz", 0.0) if v_me else 0.0
+
+                    try:
+                        vcmd = rflysim.Vel()
+                        vcmd.direct = float(v_direct_cmd)
+                        vcmd.rate = float(evade_heading)
+                        vcmd.vz = float(vz_keep)
+                        uid = self.client.set_vehicle_vel(rid, vcmd)
+                        self.recorder.mark_vel_cmd(
+                            rid, rate=vcmd.rate, direct=vcmd.direct, vz=vcmd.vz, sim_time=now_sim
+                        )
+                        print(
+                            f"[EVADE] rid={rid} mid={best_mid} CMD: rate={vcmd.rate:.1f}° direct={vcmd.direct:.1f} vz={vcmd.vz:.1f} "
+                            f"(dist={best_dist:.0f}m, reason={reason})",
+                            flush=True
+                        )
+                    except Exception as e:
+                        print(f"[EVADE] set_vehicle_vel({rid}) failed: {e}", flush=True)
+
+                    self._evasive_until[rid] = now_sim + self.EVASIVE_DURATION_SEC
+                    self._last_evasive_time[rid] = now_wall
+
+        # === 原攻击目标搜集 ===
         visible_blue_targets = set()
         for tracks in vis2.values():
             for t in tracks:
@@ -684,6 +1038,9 @@ class RedForceController:
                     continue
                 if rid in self.destroyed_targets:
                     continue
+                # 在躲避窗口内不参与开火
+                if self._evasive_until.get(rid, 0.0) > now:
+                    continue
                 if self.ammo.get(rid, 0) <= 0:
                     continue
                 if (now - self.last_fire_time.get(rid, 0.0)) < ATTACK_COOLDOWN_SEC:
@@ -705,6 +1062,9 @@ class RedForceController:
             if tid in self.destroyed_targets:
                 continue
             now_sim = self.client.get_sim_time()
+            # 躲避窗口内不执行打击
+            if self._evasive_until.get(rid, 0.0) > now_sim:
+                continue
             if (now_sim - self.last_fire_time.get(rid, 0.0)) < ATTACK_COOLDOWN_SEC:
                 continue
             if self.ammo.get(rid, 0) <= 0:
@@ -715,7 +1075,8 @@ class RedForceController:
                 ok = self._is_fire_success(uid, max_tries=5, wait_s=0.1)
                 if not ok:
                     print(f"[Red] fire NOT confirmed for {rid}->{tid}, keep target available.", flush=True)
-                    time.sleep(0.1); continue
+                    time.sleep(0.1);
+                    continue
                 self.recorder.mark_attack_success(rid, self.client.get_sim_time())
                 self.ammo[rid] -= 1
                 self.last_fire_time[rid] = self.client.get_sim_time()
@@ -723,7 +1084,8 @@ class RedForceController:
                 self.target_locks[tid] = {"red_id": rid, "until": self.client.get_sim_time() + LOCK_SEC}
                 time.sleep(0.1)
             except Exception as e:
-                print(f"[Red] set_target({rid},{tid}) failed: {e}", flush=True); continue
+                print(f"[Red] set_target({rid},{tid}) failed: {e}", flush=True);
+                continue
 
     def run_loop(self, stop_when_paused=False, max_wall_time_sec=None):
         start_t = time.time()
