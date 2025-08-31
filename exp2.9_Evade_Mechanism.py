@@ -394,7 +394,6 @@ class RLRecorder:
         print(f"[RL] Dumped {len(self.rows_for_csv)} rows to {abspath}", flush=True)
         self.has_dumped = True
 
-
 # ==================== 红方控制器（缩略自你上一版，逻辑一致） ====================
 class RedForceController:
     def __init__(self, client, red_ids, out_csv_path):
@@ -425,8 +424,8 @@ class RedForceController:
         self._last_approach_flag = {}           # rid -> 上次是否判定为“接近”
 
         # --- 躲避导弹相关常量 ---
-        self.MISSILE_THREAT_DIST_M = 30000.0      # 威胁距离阈值
-        self.MISSILE_BEARING_THRESH_DEG = 35.0   # 视线角阈值：导弹航向与“导弹->红机连线”夹角小于该值视为“冲向我”
+        self.MISSILE_THREAT_DIST_M = 50000.0      # 威胁距离阈值
+        self.MISSILE_BEARING_THRESH_DEG = 25.0   # 视线角阈值：导弹航向与“导弹->红机连线”夹角小于该值视为“冲向我”
         self.EVASIVE_TURN_DEG = 90.0             # 机动：相对导弹方向 90°
         self.EVASIVE_SPEED_MIN = 220.0           # 躲避时最低水平速度（m/s），会与当前速度取 max
         self.EVASIVE_DURATION_SEC = 10.0          # 每次躲避持续时长（限制攻击）
@@ -815,47 +814,59 @@ class RedForceController:
         # === Missile Evasion: 识别导弹 & 判定威胁 & 触发躲避（含调试打印）===
         # === Missile Evasion: 识别导弹 & 判定威胁 & 触发躲避（含详细调试打印）===
         # 说明：
-        # - mdir：用导弹上一帧与当前帧位置的方位角(北=0°, 顺时针)估算
+        # - mdir_calc：用导弹上一帧与当前帧位置的方位角(北=0°, 顺时针)估算
+        # - mspeed_calc：用两帧大圆距离 / Δt 估算（m/s）
         # - 最近红机：对每一枚导弹，找距它最近的红机 rid_near
-        # - 然后对每一架红机 rid，再找离它最近的一枚导弹做威胁判定（保持你现有的“每红机只处理一枚最近导弹”的结构）
-        # - 打印项包含：最近红机ID、mdir、los_m2red、ang_diff、approach、threat、cooldown_ok、evading_now、reason
+        # - 然后对每一架红机 rid，再找离它最近的一枚导弹做威胁判定（保持“每红机只处理一枚最近导弹”的结构）
+        # - 统一打印：最近红机ID、mdir_calc、los_m2red、ang_diff、approach、threat、cooldown_ok、evading_now、reason
+        # - 触发时额外打印：evade_heading（红机将采取的机动方向角）
 
-        # 1) 先收集所有“看上去是导弹”的目标（<10000）
-        if not hasattr(self, "_missile_prev_xy"):
-            self._missile_prev_xy = {}  # mid -> (lon, lat) 用于推算导弹朝向
-        missiles = []  # list of dict(mid, lon, lat, mspeed, mdir)
+        if not hasattr(self, "_missile_prev_xy_t"):
+            # mid -> (lon, lat, sim_t)  用于推算导弹航向与标量速度
+            self._missile_prev_xy_t = {}
 
+        missiles = []  # list of dict(mid, lon, lat, mspeed_calc, mdir_calc, mspeed_radar)
+
+        # 1) 收集 <10000 的“导弹” + 推算 mdir / mspeed
+        now_sim = self.client.get_sim_time()
         for tracks in vis2.values():
             for t in tracks:
                 tid = t.get("target_id")
                 if not _is_missile_track(tid):
                     continue
                 mid = int(tid)
-
-                # 位置：优先 get_vehicle_pos；没有就用 track 里的 target_pos
+                # 位置来源：优先 all_pos2（更实时/统一），否则用 track 中的 target_pos
                 mpos = all_pos2.get(mid)
                 if mpos and getattr(mpos, "x", None) is not None and getattr(mpos, "y", None) is not None:
                     mlon, mlat = float(mpos.x), float(mpos.y)
                 else:
                     mlon = t.get("lon");
                     mlat = t.get("lat")
-
                 if mlon is None or mlat is None:
                     continue
 
-                # 用上一帧位置估算导弹自身航向角 mdir
-                prev = self._missile_prev_xy.get(mid)
-                mdir = None
+                mdir_calc, mspeed_calc = None, None
+                prev = self._missile_prev_xy_t.get(mid)
                 if prev and prev[0] is not None and prev[1] is not None:
-                    mdir = _bearing_deg_from_A_to_B(prev[0], prev[1], mlon, mlat)
-                self._missile_prev_xy[mid] = (mlon, mlat)
+                    prev_lon, prev_lat, prev_t = prev
+                    dt = max(1e-3, float(now_sim - float(prev_t)))
+                    # 方位角（导弹上一帧 -> 当前帧）
+                    mdir_calc = _bearing_deg_from_A_to_B(prev_lon, prev_lat, mlon, mlat)
+                    # 标量速度（m/s）：两帧大圆距离 / Δt
+                    d_m = _geo_dist_haversine_m(prev_lon, prev_lat, mlon, mlat)
+                    if d_m is not None:
+                        mspeed_calc = d_m / dt
+
+                # 更新上一帧缓存
+                self._missile_prev_xy_t[mid] = (mlon, mlat, now_sim)
 
                 missiles.append({
                     "mid": mid,
                     "lon": mlon,
                     "lat": mlat,
-                    "mspeed": t.get("speed"),  # 雷达报的速度标量（如有）
-                    "mdir": mdir  # 我们根据连续位置推算的导弹朝向角
+                    "mdir": mdir_calc,  # 计算得到的“导弹速度方向角”
+                    "mspeed": mspeed_calc,  # 计算得到的速度（m/s）
+                    "mspeed_radar": t.get("speed", None)  # 雷达报的速度（若有）
                 })
 
         # 2) 为每枚导弹找“最近红机”，便于打印你要的“最近红方无人机ID”
@@ -879,8 +890,7 @@ class RedForceController:
 
         # 3) 逐红机：挑离它最近的一枚导弹，完成威胁判定 + 打印
         if missiles:
-            now_sim = self.client.get_sim_time()  # 用仿真时钟判定“机动窗口”
-            now_wall = time.time()  # 用墙钟判定“冷却时间”
+            now_wall = time.time()
             for rid in sorted(self.red_ids):
                 my_p = all_pos2.get(rid)
                 if not my_p or getattr(my_p, "x", None) is None or getattr(my_p, "y", None) is None:
@@ -899,7 +909,7 @@ class RedForceController:
                     continue
 
                 # 计算导弹->红机的视线角、夹角与“逼近”判定
-                mdir = best_meta.get("mdir")  # 可能为 None（刚出现或位置没变化）
+                mdir = best_meta.get("mdir")  # 计算得到的导弹方向角（可能为 None，刚出现时）
                 los_m2red = _bearing_deg_from_A_to_B(best_meta["lon"], best_meta["lat"], my_lon, my_lat)
                 ang_diff = _ang_diff_abs(mdir, los_m2red) if (mdir is not None and los_m2red is not None) else None
 
@@ -912,7 +922,7 @@ class RedForceController:
                     else:
                         reason = f"angle_large({ang_diff:.1f})"
                 else:
-                    # 仅用距离趋势兜底（记录每红机-导弹对的上次距离）
+                    # 距离趋势兜底（记录每红机-导弹对的上次距离）
                     key = (rid, best_mid, "dist")
                     last_d = self._missile_last_dist.get(key, None)
                     if last_d is not None and best_dist < last_d:
@@ -928,7 +938,7 @@ class RedForceController:
                 cooldown_ok = (now_wall - last_ev) >= self.EVASIVE_COOLDOWN_SEC
                 in_evasive_window = (self._evasive_until.get(rid, 0.0) > now_sim)
 
-                # 最近红机（从“导弹视角”）是谁
+                # 最近红机（从“导弹视角”）是谁（用于打印）
                 rid_near, d_near = nearest_red_of_missile.get(best_mid, (None, None))
 
                 # === 统一详细打印（带你要的全部字段） ===
@@ -939,10 +949,11 @@ class RedForceController:
                     ang_str = f"{ang_diff:.1f}" if ang_diff is not None else "None"
                     rid_near_str = f"{rid_near}" if rid_near is not None else "None"
                     d_near_str = f"{d_near:.0f}" if d_near is not None else "None"
-                    ms = best_meta.get("mspeed")
-                    mspeed_str = f"{ms:.1f}" if ms is not None else "None"
+                    ms_calc = best_meta.get("mspeed")
+                    mspeed_calc_str = f"{ms_calc:.1f}" if ms_calc is not None else "None"
+                    ms_radar = best_meta.get("mspeed_radar")
+                    mspeed_radar_str = f"{ms_radar:.1f}" if ms_radar is not None else "None"
 
-                    # 节流：每架红机 0.5s 打印一次，或者“approach”翻转时立即打印
                     lp = self._last_debug_print.get(rid, 0.0)
                     flip = (self._last_approach_flag.get(rid) != approach_ok)
                     if (now_wall - lp) >= self.MISSILE_DEBUG_PRINT_INTERVAL or flip:
@@ -950,27 +961,29 @@ class RedForceController:
                         self._last_approach_flag[rid] = approach_ok
                         print(
                             f"[MISSILE] rid={rid} mid={best_mid} "
-                            f"dist={dist_str}m mspeed={mspeed_str}m/s "
+                            f"dist={dist_str}m mspeed_calc={mspeed_calc_str}m/s mspeed_radar={mspeed_radar_str}m/s "
                             f"nearest_red_of_missile={rid_near_str}@{d_near_str}m "
-                            f"mdir={mdir_str}° los_m2red={los_str}° ang_diff={ang_str} "
+                            f"mdir_calc={mdir_str}° los_m2red={los_str}° ang_diff={ang_str} "
                             f"approach={approach_ok} threat={in_threat} "
                             f"cooldown_ok={cooldown_ok} evading_now={in_evasive_window} "
                             f"reason={reason}",
                             flush=True
                         )
 
-                # 触发条件：威胁距离 + 接近 + 冷却满足
+                # === 触发躲避 ===
                 if in_threat and approach_ok and cooldown_ok:
+                    # 取导弹参考航向（无mdir则用los兜底）
                     use_mdir = mdir if mdir is not None else (los_m2red or 0.0)
                     cand1 = _ang_norm(use_mdir + self.EVASIVE_TURN_DEG)
                     cand2 = _ang_norm(use_mdir - self.EVASIVE_TURN_DEG)
                     los_red2m = _bearing_deg_from_A_to_B(my_lon, my_lat, best_meta["lon"], best_meta["lat"])
                     away_dir = _ang_norm(los_red2m + 180.0) if los_red2m is not None else None
+
                     if away_dir is not None:
-                        # 选更背离导弹的 90° 候选
+                        # ✅ 选择更接近“背离导弹”的 90° 候选（注意：<=）
                         score1 = _ang_diff_abs(cand1, away_dir)
                         score2 = _ang_diff_abs(cand2, away_dir)
-                        evade_heading = cand1 if score1 >= score2 else cand2
+                        evade_heading = cand1 if score1 <= score2 else cand2
                     else:
                         evade_heading = cand1
 
@@ -985,16 +998,19 @@ class RedForceController:
 
                     try:
                         vcmd = rflysim.Vel()
-                        vcmd.direct = float(v_direct_cmd)
-                        vcmd.rate = float(evade_heading)
+                        #仿真接口的速度和方向角是反过来的 是环境的问题
+                        vcmd.rate = float(v_direct_cmd)
+                        vcmd.direct = float(evade_heading)
                         vcmd.vz = float(vz_keep)
                         uid = self.client.set_vehicle_vel(rid, vcmd)
                         self.recorder.mark_vel_cmd(
                             rid, rate=vcmd.rate, direct=vcmd.direct, vz=vcmd.vz, sim_time=now_sim
                         )
+                        # 这里额外打印“红机将采取的机动方向角”
                         print(
-                            f"[EVADE] rid={rid} mid={best_mid} CMD: rate={vcmd.rate:.1f}° direct={vcmd.direct:.1f} vz={vcmd.vz:.1f} "
-                            f"(dist={best_dist:.0f}m, reason={reason})",
+                            f"[EVADE] rid={rid} mid={best_mid} "
+                            f"CMD: rate(红机将采取的机动)={vcmd.rate:.1f}° direct={vcmd.direct:.1f} vz={vcmd.vz:.1f} "
+                            f"(dist={best_dist:.0f}m, 导弹速度方向角：={mdir if mdir is not None else -1:.1f}°, reason={reason})",
                             flush=True
                         )
                     except Exception as e:
