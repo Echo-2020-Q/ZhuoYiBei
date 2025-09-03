@@ -47,7 +47,7 @@ SCAN_INTERVAL_SEC = 0.1
 LOCK_SEC = 40.0
 BLUE_SIDE_CODE = 2
 DESTROY_CODES = {1}
-DELAY_DURATION = 1.0
+DELAY_DURATION = 1.0  # 全灭后优雅收尾时间（秒）
 
 vel_0 = rflysim.Vel()
 vel_0.vz = 150
@@ -496,9 +496,7 @@ class FormationManager:
         pL = pos_all.get(self.leader_id)
         if not pL or getattr(pL, "x", None) is None or getattr(pL, "y", None) is None:
             return
-        # 根据“队长→边界中心方向”粗估航向所在扇区（若无法估计，也用最近速度向量）
-        # 这里不严格依赖航向，更多是“经过此处就算探索”
-        # 简化：队长处将所有扇区里“距离边界更近的方向”打一次时间戳（强行避免原地抖动未探索）
+        # 简化：队长处将所有扇区里“距离边界更近的方向”打一次时间戳
         for i in range(SECTOR_NUM):
             self.sector_last_seen[i] = max(self.sector_last_seen[i], tnow)
 
@@ -521,8 +519,6 @@ class FormationManager:
         if pL and getattr(pL, "x", None) is not None and getattr(pL, "y", None) is not None:
             lon, lat = float(pL.x), float(pL.y)
             dL, dR, dD, dU = _dist_to_boundary_m(client, lon, lat)
-            # 远离最近边界的方向给予轻微偏好
-            # 粗略优先：向最“宽”的方向（上/下/左/右）的扇区，中心角 ±UNKNOWN_BONUS_DEG
             wide_dir = None
             arr = [("N", dU, 0.0), ("E", dR, 90.0), ("S", dD, 180.0), ("W", dL, 270.0)]
             wide_dir = max(arr, key=lambda x: x[1])[2] if arr else None
@@ -537,11 +533,10 @@ class FormationManager:
             base = _sector_center_deg(i, SECTOR_NUM)
             if wide_dir is None:
                 return 0.0
-            return -_ang_diff_abs(base, wide_dir)  # 越接近越好（分数更大）
+            return -_ang_diff_abs(base, wide_dir)  # 越接近越好
         best = max(cand_idxs, key=score) if cand_idxs else 0
         base_heading = _sector_center_deg(best, SECTOR_NUM)
 
-        # 稍微给点随机扰动，避免卡住扇区边界（可选）
         return base_heading
 
 
@@ -655,7 +650,7 @@ class RLRecorder:
             return
         n_act = 16
         n_obs = len(self.rows_for_csv[0]) - 1 - n_act
-        header = ["t"] + [f"obs_{i}" for i in range(n_obs)] + [f"act_{j}" for j in range(n_act)]
+        header = ["t"] + [f"obs_{i}" for i in range(n_obs)] + [f"act_{j}" for j in n_act and range(n_act)]
         abspath = os.path.abspath(path)
         os.makedirs(os.path.dirname(abspath), exist_ok=True)
         with open(abspath, "w", newline="", encoding="utf-8") as f:
@@ -701,22 +696,30 @@ class RedForceController:
         self.MISSILE_THREAT_DIST_M = 50000.0      # 威胁距离阈值
         self.MISSILE_BEARING_THRESH_DEG = 25.0   # 视线角阈值：导弹航向与“导弹->红机连线”夹角小于该值视为“冲向我”
         self.EVASIVE_TURN_DEG = 90.0             # 机动：相对导弹方向 90°
-        self.EVASIVE_SPEED_MIN = 220.0           # 躲避时最低水平速度（m/s），会与当前速度取 max
-        self.EVASIVE_DURATION_SEC = 10.0          # 每次躲避持续时长（限制攻击）
-        self.EVASIVE_COOLDOWN_SEC = 5.0          # 躲避冷却：避免频繁反复机动
+        # --- S曲线参数（新增） ---
+        self.EVASIVE_S_AMP_DEG    = 35.0         # S 曲线摆幅（±角度）
+        self.EVASIVE_S_PERIOD_SEC = 6.0          # S 曲线一个周期（秒）
+        self.EVASIVE_SPEED_MIN    = 240.0        # 躲避时最低水平速度（m/s）
+        self.EVASIVE_DURATION_SEC = 10.0         # 躲避持续时长（秒）
+        self.EVASIVE_COOLDOWN_SEC = 5.0          # 躲避冷却（秒）
 
         # --- 躲避导弹状态 ---
         self._missile_last_dist = {}             # key=(rid, mid) -> 上次测得距离（米）
         # --- 导弹轨迹缓存：mid -> {"lon": float, "lat": float, "t": float}
         self._missile_last = {}
-        self._evasive_until = {}                 # rid -> 时间戳（在此之前禁止开火）
-        self._last_evasive_time = {}             # rid -> 最近一次触发躲避的时间戳
+        self._evasive_until = {}                 # rid -> 模拟时间戳（在此之前处于躲避中/禁止开火）
+        self._last_evasive_time = {}             # rid -> 最近一次触发躲避（墙钟）
+        self._evasive_state = {}                 # rid -> {"t0","base","amp","period","spd","vz"}
 
-        # --- 全灭后延迟结束（20s） ---
+        # --- 躲避结束后的“回归队列”追槽窗口（新增） ---
+        self.REJOIN_DURATION_SEC = 8.0
+        self.REJOIN_EXTRA_BOOST  = 60.0          # 在原 SLOT_MAX_BOOST 基础上额外给的上限
+        self._rejoin_until       = {}            # rid -> 模拟时间戳（在此之前启用追槽增强）
+        self.REJOIN_FORCE_FORMATION_AFTER_EVADE = True  # 躲避结束后强制回到编队阶段
+
+        # --- 全灭后延迟结束（DELAY_DURATION 秒） ---
         self._end_grace_until = None   # None 或 墙钟时间戳（time.time()）
         self._end_reason = ""
-
-
 
         for rid in red_ids:
             try:
@@ -753,6 +756,14 @@ class RedForceController:
         dist = _geo_dist_haversine_m(prev["lon"], prev["lat"], lon_now, lat_now) or 0.0
         mspeed = dist / dt  # m/s
         return (mdir, mspeed)
+
+    def _evasive_s_heading(self, base_deg, t_elapsed, amp_deg, period_sec):
+        """以 base 为中心、按正弦调制的 S 曲线航向（0°=北，顺时针）。"""
+        import math
+        if period_sec <= 1e-3:
+            return base_deg % 360.0
+        phase = 2.0 * math.pi * (t_elapsed / period_sec)
+        return (base_deg + amp_deg * math.sin(phase)) % 360.0
 
     def _is_blue_side(self, side):
         return side in (2, "SIDE_BLUE", "BLUE")
@@ -811,7 +822,8 @@ class RedForceController:
             if score_obj:
                 print(f"[Final Score {where}]", score_obj, flush=True)
                 return score_obj
-            time.sleep(wait)
+        # 等待间隔放在循环外更稳定
+        time.sleep(wait)
         print(f"[Final Score {where}] still None after retry.", flush=True)
         return None
 
@@ -872,18 +884,18 @@ class RedForceController:
                     self.target_locks.pop(vvid, None)
         if any_new:
             print(f"[Situ] BLUE destroyed: {sorted(self.destroyed_blue)} | RED destroyed: {sorted(self.destroyed_red)}", flush=True)
-        # === 全灭后延迟 20s 才真正结束 ===
+        # === 全灭后延迟 DELAY_DURATION 秒 才真正结束 ===
         import time as _time
         now_wall = _time.time()
 
-        # 首次触发：设置 20s 优雅收尾窗口
+        # 首次触发：设置优雅收尾窗口
         if (len(self.destroyed_blue) >= 4 or len(self.destroyed_red) >= 4) and self._end_grace_until is None:
             if len(self.destroyed_blue) >= 4:
                 self._end_reason = "All 4 BLUE aircraft destroyed."
             else:
                 self._end_reason = "All 4 RED aircraft destroyed."
             self._end_grace_until = now_wall + DELAY_DURATION
-            print(f"[Grace] {self._end_reason} Ending in 20s...", flush=True)
+            print(f"[Grace] {self._end_reason} Ending in {DELAY_DURATION:.0f}s...", flush=True)
             return  # 本次先不结束，等下次再检查是否到时
 
         # 已经在优雅收尾窗口中：到点就结束
@@ -998,7 +1010,6 @@ class RedForceController:
         if self._ended:
             return
 
-
         # —— 执行攻击逻辑（与单轮版一致）——
         try:
             raw_visible2 = self.client.get_visible_vehicles()
@@ -1062,7 +1073,6 @@ class RedForceController:
                             if raw_track:
                                 break
 
-                        # 打印一行：原始 track、位置、速度（vx/vy/vz & 直读的 direct/rate）
                         print(
                             "[RAW] mid={} track={} pos=({:.6f},{:.6f}) vel={{vx:{}, vy:{}, vz:{}, direct:{}, rate:{}}}".format(
                                 mid,
@@ -1079,6 +1089,7 @@ class RedForceController:
                         )
             except Exception as e:
                 print("[RAW MISSILES] dump failed:", e, flush=True)
+
         # >>> add: 如果仍在编队阶段，则执行 V 形编队前进（探索未知扇区）
         if self.formation_active:
             # 条件：若有蓝机目标可见，则退出编队
@@ -1100,8 +1111,6 @@ class RedForceController:
                 heading = self.fm.choose_unexplored_heading(self.client, all_pos)
 
                 # --- 以队长为参考，计算四机目标速度命令 ---
-                # 获取队长位置
-                # --- 原来选择 heading 之后，替换下发速度命令为“槽位收敛控制” ---
                 pL = all_pos.get(self.fm.leader_id)
                 if pL and getattr(pL, "x", None) is not None and getattr(pL, "y", None) is not None:
                     LON0, LAT0 = float(pL.x), float(pL.y)
@@ -1115,11 +1124,10 @@ class RedForceController:
                         vcmd.direct = safe_h
                         vcmd.vz = float(FORMATION_VZ_KEEP)
                         uid = self.client.set_vehicle_vel(self.fm.leader_id, vcmd)
-
                     except Exception as e:
                         print(f"[Formation] leader set_vehicle_vel({self.fm.leader_id}) failed:", e, flush=True)
 
-                    # 其他三机：朝“各自槽位”做 P 收敛
+                    # 其他三机：朝“各自槽位”做 P 收敛（含回归窗口追槽增强）
                     for rid in sorted(self.red_ids):
                         if rid == self.fm.leader_id:
                             continue
@@ -1136,24 +1144,26 @@ class RedForceController:
                         dN_w, dE_w = _rotate_offsets_body_to_NE((dN_body, dE_body), heading)
 
                         # 误差（希望达到：队长原点 + 槽位偏置）
+                        import math
                         errN = dN_w - (n_me or 0.0)
                         errE = dE_w - (e_me or 0.0)
-                        # 槽位距离（米）
-                        import math
                         err_norm = math.hypot(errN, errE)
 
                         # 期望航向：指向槽位的方位（0北顺时针）
                         desired_heading = (math.degrees(math.atan2(errE, errN)) + 360.0) % 360.0
 
-                        # 水平速度：编队基速 + 误差加成（限幅），到位后仅保留基速沿 heading 前进
+                        # 水平速度：编队基速 + 误差加成（限幅），回归窗口内额外增强
                         boost = 0.0
                         if FORMATION_TIGHT and err_norm > SLOT_TOL_M:
-                            boost = min(SLOT_MAX_BOOST, SLOT_GAIN * err_norm)
+                            base_boost = min(SLOT_MAX_BOOST, SLOT_GAIN * err_norm)
+                            # 躲避刚结束的回归窗口内，放宽上限、加速追槽
+                            if self._rejoin_until.get(rid, 0.0) > sim_t:
+                                base_boost = min(SLOT_MAX_BOOST + self.REJOIN_EXTRA_BOOST,
+                                                 base_boost + self.REJOIN_EXTRA_BOOST)
+                            boost = base_boost
                         speed_cmd = float(FORMATION_SPEED_MPS + boost)
 
-                        # 为了“既朝槽位收敛、又整体前进”，我们采用“双模选择”：
-                        # - 误差较大：朝 desired_heading 直指槽位
-                        # - 误差进入近场：改为与队长同航向 heading，避免收敛后角度持续摆动
+                        # “既朝槽位收敛、又整体前进”的双模
                         use_heading = desired_heading if err_norm > (1.5 * SLOT_TOL_M) else (heading % 360.0)
 
                         try:
@@ -1182,16 +1192,7 @@ class RedForceController:
         for tid in expired:
             self.target_locks.pop(tid, None)
 
-        # === Missile Evasion: 识别导弹 & 判定威胁 & 触发躲避（含调试打印）===
         # === Missile Evasion: 识别导弹 & 判定威胁 & 触发躲避（含详细调试打印）===
-        # 说明：
-        # - mdir_calc：用导弹上一帧与当前帧位置的方位角(北=0°, 顺时针)估算
-        # - mspeed_calc：用两帧大圆距离 / Δt 估算（m/s）
-        # - 最近红机：对每一枚导弹，找距它最近的红机 rid_near
-        # - 然后对每一架红机 rid，再找离它最近的一枚导弹做威胁判定（保持“每红机只处理一枚最近导弹”的结构）
-        # - 统一打印：最近红机ID、mdir_calc、los_m2red、ang_diff、approach、threat、cooldown_ok、evading_now、reason
-        # - 触发时额外打印：evade_heading（红机将采取的机动方向角）
-
         if not hasattr(self, "_missile_prev_xy_t"):
             # mid -> (lon, lat, sim_t)  用于推算导弹航向与标量速度
             self._missile_prev_xy_t = {}
@@ -1211,8 +1212,7 @@ class RedForceController:
                 if mpos and getattr(mpos, "x", None) is not None and getattr(mpos, "y", None) is not None:
                     mlon, mlat = float(mpos.x), float(mpos.y)
                 else:
-                    mlon = t.get("lon");
-                    mlat = t.get("lat")
+                    mlon = t.get("lon"); mlat = t.get("lat")
                 if mlon is None or mlat is None:
                     continue
 
@@ -1235,12 +1235,12 @@ class RedForceController:
                     "mid": mid,
                     "lon": mlon,
                     "lat": mlat,
-                    "mdir": mdir_calc,  # 计算得到的“导弹速度方向角”
-                    "mspeed": mspeed_calc,  # 计算得到的速度（m/s）
+                    "mdir": mdir_calc,          # 计算得到的“导弹速度方向角”
+                    "mspeed": mspeed_calc,      # 计算得到的速度（m/s）
                     "mspeed_radar": t.get("speed", None)  # 雷达报的速度（若有）
                 })
 
-        # 2) 为每枚导弹找“最近红机”，便于打印你要的“最近红方无人机ID”
+        # 2) 为每枚导弹找“最近红机”，便于打印“最近红机ID”
         nearest_red_of_missile = {}  # mid -> (rid_near, dist_m)
         if missiles:
             for m in missiles:
@@ -1259,7 +1259,7 @@ class RedForceController:
                 if rid_near is not None:
                     nearest_red_of_missile[mid] = (rid_near, d_near)
 
-        # 3) 逐红机：挑离它最近的一枚导弹，完成威胁判定 + 打印
+        # 3) 逐红机：挑离它最近的一枚导弹，完成威胁判定 + 打印 + 触发躲避（记录S曲线状态）
         if missiles:
             now_wall = time.time()
             for rid in sorted(self.red_ids):
@@ -1312,7 +1312,7 @@ class RedForceController:
                 # 最近红机（从“导弹视角”）是谁（用于打印）
                 rid_near, d_near = nearest_red_of_missile.get(best_mid, (None, None))
 
-                # === 统一详细打印（带你要的全部字段） ===
+                # 打印
                 if self.DEBUG_EVADE:
                     dist_str = f"{best_dist:.0f}" if best_dist is not None else "-"
                     mdir_str = f"{mdir:.1f}" if mdir is not None else "None"
@@ -1322,13 +1322,13 @@ class RedForceController:
                     d_near_str = f"{d_near:.0f}" if d_near is not None else "None"
                     ms_calc = best_meta.get("mspeed")
                     mspeed_calc_str = f"{ms_calc:.1f}" if ms_calc is not None else "None"
-                    ms_radar = best_meta.get("mspeed_radar")
+                    ms_radar = best_meta.get("speed")
                     mspeed_radar_str = f"{ms_radar:.1f}" if ms_radar is not None else "None"
 
                     lp = self._last_debug_print.get(rid, 0.0)
                     flip = (self._last_approach_flag.get(rid) != approach_ok)
-                    if (now_wall - lp) >= self.MISSILE_DEBUG_PRINT_INTERVAL or flip:
-                        self._last_debug_print[rid] = now_wall
+                    if (time.time() - lp) >= self.MISSILE_DEBUG_PRINT_INTERVAL or flip:
+                        self._last_debug_print[rid] = time.time()
                         self._last_approach_flag[rid] = approach_ok
                         print(
                             f"[MISSILE] rid={rid} mid={best_mid} "
@@ -1341,62 +1341,72 @@ class RedForceController:
                             flush=True
                         )
 
-                # === 触发躲避 ===
+                # === 触发躲避（记录 S 曲线状态，实际驱动在下方每tick执行） ===
                 if in_threat and approach_ok and cooldown_ok:
-                    # 取导弹参考航向（无mdir则用los兜底）
+                    # 取导弹参考航向（无mdir则用los兜底），选“更背离导弹”的±90°为 base
                     use_mdir = mdir if mdir is not None else (los_m2red or 0.0)
                     cand1 = _ang_norm(use_mdir + self.EVASIVE_TURN_DEG)
                     cand2 = _ang_norm(use_mdir - self.EVASIVE_TURN_DEG)
                     los_red2m = _bearing_deg_from_A_to_B(my_lon, my_lat, best_meta["lon"], best_meta["lat"])
-                    away_dir = _ang_norm(los_red2m + 180.0) if los_red2m is not None else None
+                    away_dir = _ang_norm(los_red2m + 180.0) if los_red2m is not None else _ang_norm(use_mdir + 180.0)
+                    score1 = _ang_diff_abs(cand1, away_dir)
+                    score2 = _ang_diff_abs(cand2, away_dir)
+                    base_dir = cand1 if score1 <= score2 else cand2
 
-                    if away_dir is not None:
-                        # ✅ 选择更接近“背离导弹”的 90° 候选（注意：<=）
-                        score1 = _ang_diff_abs(cand1, away_dir)
-                        score2 = _ang_diff_abs(cand2, away_dir)
-                        evade_heading = cand1 if score1 <= score2 else cand2
-                    else:
-                        evade_heading = cand1
-
-                    # 水平速度：max(当前, 最小)
+                    # 速度与vz
                     v_me = vel_all2.get(rid) if vel_all2 else None
-                    v_direct_now, _ = _direct_rate_from_vx_vy(
-                        getattr(v_me, "vx", 0.0) if v_me else 0.0,
-                        getattr(v_me, "vy", 0.0) if v_me else 0.0
-                    )
-                    v_direct_cmd = max(float(v_direct_now or 0.0), self.EVASIVE_SPEED_MIN)
+                    v_now, _ = _direct_rate_from_vx_vy(getattr(v_me, "vx", 0.0) if v_me else 0.0,
+                                                       getattr(v_me, "vy", 0.0) if v_me else 0.0)
+                    spd_cmd = max(float(v_now or 0.0), self.EVASIVE_SPEED_MIN)
                     vz_keep = getattr(v_me, "vz", 0.0) if v_me else 0.0
 
-                    try:
-                        # vcmd = rflysim.Vel()
-                        # #仿真接口的速度和方向角是反过来的 是环境的问题
-                        # vcmd.rate = float(v_direct_cmd)
-                        # vcmd.direct = float(evade_heading)
-                        # vcmd.vz = float(vz_keep)
-                        # uid = self.client.set_vehicle_vel(rid, vcmd)
-                        vcmd = rflysim.Vel()
-                        safe_h, safe_spd = _guard_heading(self.client, my_lon, my_lat, float(evade_heading),
-                                                          float(v_direct_cmd))
-                        vcmd.rate = safe_spd
-                        vcmd.direct = safe_h
-                        vcmd.vz = float(vz_keep)
-                        uid = self.client.set_vehicle_vel(rid, vcmd)
-
-                        self.recorder.mark_vel_cmd(
-                            rid, rate=vcmd.rate, direct=vcmd.direct, vz=vcmd.vz, sim_time=now_sim
-                        )
-                        # 这里额外打印“红机将采取的机动方向角”
-                        print(
-                            f"[EVADE] rid={rid} mid={best_mid} "
-                            f"CMD: rate(红机将采取的机动)={vcmd.rate:.1f}° direct={vcmd.direct:.1f} vz={vcmd.vz:.1f} "
-                            f"(dist={best_dist:.0f}m, 导弹速度方向角：={mdir if mdir is not None else -1:.1f}°, reason={reason})",
-                            flush=True
-                        )
-                    except Exception as e:
-                        print(f"[EVADE] set_vehicle_vel({rid}) failed: {e}", flush=True)
-
+                    # 记录状态，由“躲避驱动”在每个tick下发S曲线命令
+                    self._evasive_state[rid] = {
+                        "t0": now_sim,
+                        "base": float(base_dir),
+                        "amp": float(self.EVASIVE_S_AMP_DEG),
+                        "period": float(self.EVASIVE_S_PERIOD_SEC),
+                        "spd": float(spd_cmd),
+                        "vz": float(vz_keep),
+                    }
                     self._evasive_until[rid] = now_sim + self.EVASIVE_DURATION_SEC
                     self._last_evasive_time[rid] = now_wall
+
+                    print(f"[EVADE-START] rid={rid} mid={best_mid} base={base_dir:.1f}° "
+                          f"S-amp=±{self.EVASIVE_S_AMP_DEG:.1f}° T={self.EVASIVE_S_PERIOD_SEC:.1f}s "
+                          f"spd≥{spd_cmd:.1f} vz={vz_keep:.1f} reason={reason}",
+                          flush=True)
+
+        # === 持续驱动：对处于躲避窗口内的红机，按 S 曲线每tick下发速度命令 ===
+        now_sim = self.client.get_sim_time()
+        for rid in sorted(self.red_ids):
+            if self._evasive_until.get(rid, 0.0) > now_sim:
+                st = self._evasive_state.get(rid)
+                rp = all_pos2.get(rid)
+                if not st or not rp or getattr(rp, "x", None) is None or getattr(rp, "y", None) is None:
+                    continue
+                my_lon, my_lat = float(rp.x), float(rp.y)
+                t_elapsed = max(0.0, now_sim - float(st["t0"]))
+                h_cmd = self._evasive_s_heading(st["base"], t_elapsed, st["amp"], st["period"])
+                safe_h, safe_spd = _guard_heading(self.client, my_lon, my_lat, float(h_cmd), float(st["spd"]))
+                try:
+                    vcmd = rflysim.Vel()
+                    vcmd.rate   = safe_spd
+                    vcmd.direct = safe_h
+                    vcmd.vz     = float(st["vz"])
+                    uid = self.client.set_vehicle_vel(rid, vcmd)
+                    self.recorder.mark_vel_cmd(rid, rate=vcmd.rate, direct=vcmd.direct, vz=vcmd.vz, sim_time=now_sim)
+                except Exception as e:
+                    print(f"[EVADE-DRIVE] set_vehicle_vel({rid}) failed:", e, flush=True)
+
+        # === 躲避窗口刚结束：清状态并开启“回归队列”追槽窗口 ===
+        for rid in sorted(self.red_ids):
+            if self._evasive_until.get(rid, 0.0) <= now_sim and rid in self._evasive_state:
+                self._evasive_state.pop(rid, None)
+                self._rejoin_until[rid] = now_sim + self.REJOIN_DURATION_SEC
+                print(f"[EVADE-END] rid={rid} -> rejoin until t={self._rejoin_until[rid]:.1f}", flush=True)
+                if self.REJOIN_FORCE_FORMATION_AFTER_EVADE:
+                    self.formation_active = True
 
         # === 原攻击目标搜集 ===
         visible_blue_targets = set()
