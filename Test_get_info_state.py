@@ -25,6 +25,110 @@ vel_0.rate = 200 # 速率
 vel_0.direct = 90 # 速度在地图内的绝对方向，正北为0，0-360表示完整一周的方向
 
 last_step_time=0
+
+
+def log_situ_loop_filter(client, hz=1.0):
+    """每秒打印一次 get_situ_info() 中 ID <= 10 的原始条目"""
+    interval = 1.0 / max(1e-6, hz)
+    while True:
+        try:
+            ts = float(client.get_sim_time() or 0.0)
+
+            situ = client.get_situ_info()
+            if isinstance(situ, dict):
+                # 过滤 ID ≤ 10
+                filtered = {k: v for k, v in situ.items() if int(k) <= 10}
+                if filtered:
+                    print(f"\n[Situ @{ts:.1f}s RAW, ID<=10] {filtered}", flush=True)
+            else:
+                # 如果不是 dict（可能是字符串），就原样打印
+                print(f"\n[Situ @{ts:.1f}s RAW] {situ}", flush=True)
+
+        except Exception as e:
+            print(f"[Situ logger] error: {e}", flush=True)
+
+        time.sleep(interval)
+
+
+def _safe_get(d, *keys, default=None):
+    for k in keys:
+        if k in d and d[k] is not None:
+            return d[k]
+    return default
+
+def log_situ_loop(client, hz=1.0):
+    """
+    每秒打印一次 get_situ_info()：
+    - 原始返回（raw dump）
+    - 关键字段摘要（id/side/damage_state/...）
+    """
+    interval = 1.0 / max(1e-6, hz)
+    while True:
+        try:
+            ts = 0.0
+            try:
+                ts = float(client.get_sim_time() or 0.0)
+            except Exception:
+                pass
+
+            situ = client.get_situ_info()  # 可能是 dict / 对象 / 字符串
+            print(f"\n[Situ @{ts:.1f}s] ---------- RAW ----------", flush=True)
+            print(situ, flush=True)  # 原样打印“所有信息”
+
+            # --------- 摘要视图（更易读） ---------
+            print(f"[Situ @{ts:.1f}s] ---------- SUMMARY ----------", flush=True)
+            if isinstance(situ, dict):
+                for k, v in situ.items():
+                    vd = _as_dict(v)  # 兼容对象/字典
+                    vid  = _safe_get(vd, "id", default=k)
+                    side = _safe_get(vd, "side", default=None)
+                    dmg  = _safe_get(vd, "damage_state", "damage state", default=None)
+
+                    # 尝试位置/速度等常见字段（没有就略过）
+                    pos  = _safe_get(vd, "pos", "position", "target_pos", "target pos", default={})
+                    pd   = _as_dict(pos)
+                    x = _safe_get(pd, "x", "lon", "lng", default=None)
+                    y = _safe_get(pd, "y", "lat", default=None)
+                    z = _safe_get(pd, "z", default=None)
+
+                    speed = _safe_get(vd, "speed", "target_speed", "vel", default=None)
+                    direct = _safe_get(vd, "direction", "target_direction", "direct", default=None)
+                    reliability = _safe_get(vd, "reliability", default=None)
+                    track_state = _safe_get(vd, "track_state", "track state", default=None)
+
+                    print(f"ID={vid} | side={side} | damage_state={dmg} | "
+                          f"pos=({x},{y},{z}) | speed={speed} | direction={direct} | "
+                          f"reliability={reliability} | track_state={track_state}",
+                          flush=True)
+            else:
+                # 如果不是 dict（比如 SDK 打成大字符串），已经在 RAW 里有了
+                print("(summary skipped: non-dict situ payload)", flush=True)
+
+        except Exception as e:
+            print(f"[Situ logger] error: {e}", flush=True)
+
+        time.sleep(interval)
+
+def log_situ_loop_raw(client, hz=1.0):
+    """每秒打印一次 get_situ_info() 的原始输出"""
+    interval = 1.0 / max(1e-6, hz)
+    while True:
+        try:
+            ts = 0.0
+            try:
+                ts = float(client.get_sim_time() or 0.0)
+            except Exception:
+                pass
+
+            situ = client.get_situ_info()
+            print(f"\n[Situ @{ts:.1f}s RAW] {situ}", flush=True)
+
+        except Exception as e:
+            print(f"[Situ logger] error: {e}", flush=True)
+
+        time.sleep(interval)
+
+
 def _as_dict(obj):
     """把 track/pos 统一成 dict 读取（兼容属性对象 / dict）"""
     if obj is None:
@@ -699,6 +803,13 @@ if __name__ == "__main__":
     red_thread = threading.Thread(target=red_ctrl.run_loop, daemon=True)
     red_thread.start()
     print("[Main] Red control loop started.", flush=True)
+
+
+    # 启动态势信息打印线程，只输出 ID<=10
+    situ_thread = threading.Thread(target=log_situ_loop_filter, args=(client, 1.0), daemon=True)
+    situ_thread.start()
+    print("[Main] Situ RAW logger (ID<=10, 1 Hz) started.", flush=True)
+
 
     # 4) 主线程做点轻量工作，避免退出
     try:
