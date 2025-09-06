@@ -365,17 +365,22 @@ class _RNNRuntime(_nn.Module):
         super().__init__()
         rnn_cls = {"gru": _nn.GRU, "lstm": _nn.LSTM}[rnn_type]
         self.rnn_type = rnn_type
-        self.rnn = rnn_cls(in_dim, hidden_size, num_layers=num_layers, batch_first=True,
-                           dropout=dropout if num_layers>1 else 0.0)
-        self.head_c = _nn.Linear(hidden_size, cont_dim) if cont_dim>0 else None
-        self.head_b = _nn.Linear(hidden_size, bin_dim)  if bin_dim>0 else None
-    def forward(self, x, h=None):
-        z, h = self.rnn(x, h)  # x: [1,1,D]
-        out={}
-        if self.head_c is not None: out["cont"] = self.head_c(z)       # [1,1,Cc]
-        if self.head_b is not None: out["bin_logits"] = self.head_b(z) # [1,1,Cb]
-        return out, h
+        self.rnn = rnn_cls(
+            in_dim, hidden_size, num_layers=num_layers, batch_first=True,
+            dropout=dropout if num_layers > 1 else 0.0
+        )
+        # 头部命名统一用 head_c / head_b（与 forward 对应）
+        self.head_c = _nn.Linear(hidden_size, cont_dim) if cont_dim > 0 else None
+        self.head_b = _nn.Linear(hidden_size, bin_dim) if bin_dim > 0 else None
 
+    def forward(self, x, h=None):
+        z, h = self.rnn(x, h)  # x: [B,T,D]；在线推理时 B=T=1
+        out = {}
+        if self.head_c is not None:
+            out["cont"] = self.head_c(z)  # [B,T,Cc]
+        if self.head_b is not None:
+            out["bin_logits"] = self.head_b(z)  # [B,T,Cb]
+        return out, h
 class BCSeqPredictor64x16:
     """
     - 读入 ./bc_out_seq/seq_meta.json + seq_policy.pt
@@ -403,7 +408,18 @@ class BCSeqPredictor64x16:
             rnn_type=m["rnn_type"], hidden_size=m["hidden_size"],
             num_layers=m["num_layers"], dropout=m["dropout"]
         )
-        self.model.load_state_dict(_torch.load(pol_path, map_location=device))
+        state = _torch.load(pol_path, map_location=device)
+        # 将训练时的 head_cont/head_bin 重命名为运行时的 head_c/head_b
+        new_state = {}
+        for k, v in state.items():
+            if k.startswith("head_cont."):
+                new_state[k.replace("head_cont.", "head_c.")] = v
+            elif k.startswith("head_bin."):
+                new_state[k.replace("head_bin.", "head_b.")] = v
+            else:
+                new_state[k] = v
+        self.model.load_state_dict(new_state, strict=True)
+
         self.model.eval()
         self.device = _torch.device(device)
         self.h = None
@@ -642,61 +658,57 @@ class RedForceController:
                 print(f"[Red] set_vehicle_vel({rid}) failed: {e}", flush=True)
 
     # ---- 内部工具 ----
+    # ---- 内部工具 ----
+    def _resolve_latest_seq_dir(self, root):
+        import os, glob
+        # 支持直接就是落在根目录，或在时间戳子目录
+        candidates = []
+        # 1) 根目录
+        if os.path.exists(os.path.join(root, "seq_meta.json")) and os.path.exists(os.path.join(root, "seq_policy.pt")):
+            candidates.append(root)
+        # 2) 子目录
+        for d in sorted(glob.glob(os.path.join(root, "*")), reverse=True):
+            if os.path.isdir(d) and \
+                    os.path.exists(os.path.join(d, "seq_meta.json")) and \
+                    os.path.exists(os.path.join(d, "seq_policy.pt")):
+                candidates.append(d)
+        return candidates[0] if candidates else None
+
     def attach_bc_policy(self, bc_out_dir: str):
-        """
-        尝试加载序列/MLP两种策略；失败则退回基线，并给出显眼的告警。
-        """
-        import glob, json, os, torch, traceback
+        import os, traceback
         self._bc_out_dir = bc_out_dir
-        self._bc = None  # MLP 推理器（可选）
-        self._bc_seq = None  # RNN 推理器（可选）
-        self._bc_mode = "none"  # {'seq','mlp','none'}
+        self._bc = None
+        self._bc_seq = None
+        self._bc_mode = "none"
 
         try:
-            seq_meta = os.path.join(bc_out_dir, "seq_meta.json")
-            mlp_meta = os.path.join(bc_out_dir, "meta.json")
             print(f"[BC] Try load from: {bc_out_dir}", flush=True)
 
-            if os.path.exists(seq_meta):
-                print("[BC] Found sequence meta (seq_meta.json). Loading sequence policy...", flush=True)
-                # === 你的RNN推理类名可能是 _RNNRuntime；这里按你的工程实际类名引入 ===
-                # from your_module import _RNNRuntime
-                with open(seq_meta, "r", encoding="utf-8") as f:
-                    meta = json.load(f)
-                pt = os.path.join(bc_out_dir, "seq_policy.pt")
-                if not os.path.exists(pt):
-                    raise FileNotFoundError(f"seq_policy.pt not found under {bc_out_dir}")
-                # --- 构造网络（确保头名字与训练一致：head_cont/head_bin）---
-                in_dim = meta["model"]["in_dim"]
-                hidden = meta["model"]["hidden_size"]
-                num_layers = meta["model"]["num_layers"]
-                rnn_type = meta["model"].get("rnn_type", "gru")
-                cont_dim = meta["model"]["cont_dim"]
-                bin_dim = meta["model"]["bin_dim"]
-                # 这里示例：你项目里已有 _RNNRuntime，就直接用；若没有，用自己的类名
-                net = _RNNRuntime(in_dim, hidden, num_layers, rnn_type, cont_dim, bin_dim)
-                state = torch.load(pt, map_location="cpu")
-                net.load_state_dict(state, strict=True)
-                net.eval()
-                self._bc_seq = {"net": net, "meta": meta}
+            # —— 先找序列策略（优先级高）——
+            real_seq_dir = self._resolve_latest_seq_dir(bc_out_dir)
+            if real_seq_dir is not None:
+                print(f"[BC] Found sequence policy under: {real_seq_dir}", flush=True)
+                # 直接使用你上面定义的推理器
+                self._bc_seq = BCSeqPredictor64x16(real_seq_dir, device="cpu")
                 self._bc_mode = "seq"
-                print(f"[BC] Loaded SEQ policy ok: {pt}", flush=True)
+                print(f"[BC] Loaded SEQ policy ok: {real_seq_dir}", flush=True)
+                return
 
-            elif os.path.exists(mlp_meta):
+            # —— 再尝试 MLP（如果你也会导出 meta.json/policy.pt）——
+            if os.path.exists(os.path.join(bc_out_dir, "meta.json")):
                 print("[BC] Found MLP meta (meta.json). Loading MLP policy...", flush=True)
-                # === 你的 MLP 推理器（BCPredictor64x16） ===
                 self._bc = BCPredictor64x16(bc_out_dir)
                 self._bc_mode = "mlp"
                 print(f"[BC] Loaded MLP policy ok from {bc_out_dir}", flush=True)
+                return
 
-            else:
-                print(f"[BC-WARN] No seq_meta.json or meta.json under {bc_out_dir}. Fall back to baseline.", flush=True)
-                self._bc_mode = "none"
+            print(
+                f"[BC-WARN] No seq_meta.json or meta.json under {bc_out_dir} (or its subfolders). Fall back to baseline.",
+                flush=True)
 
         except Exception as e:
             print(f"[BC] load failed: {e}", flush=True)
             traceback.print_exc()
-            # ⭐ 显眼的告警：明确告诉你退回基线逻辑
             print("[BC-WARN] 策略加载失败！红方将退回默认逻辑（就近分配/冷却/弹药/躲避），不参考策略输出。", flush=True)
             self._bc = None
             self._bc_seq = None
@@ -980,37 +992,28 @@ class RedForceController:
                     # 没有策略输出 -> 清零当秒意图，继续执行后面的基线开火逻辑
                     for rid in self.red_ids:
                         self._policy_attack_intent[rid] = 0
-                    # 不要 return
-
-                # 2) 按 sorted(self.red_ids) 的顺序切片，每架 4 维 [rate, direct, vz, attack]
-                red_list = sorted(self.red_ids)
-                for idx, rid in enumerate(red_list):
-                    a0, a1, a2, a3 = [float(act_full[idx * 4 + k]) for k in range(4)]
-
-                    # 环境接口的“速率/方向角互换”坑：vcmd.rate=速度标量，vcmd.direct=航向角(北=0顺时针)
-                    vcmd = rflysim.Vel()
-                    vcmd.rate = max(0.0, float(a1))  # direct=速度大小
-                    vcmd.direct = float(a0) % 360.0  # rate=航向角
-                    vcmd.vz = float(a2)
-
-                    now_sim = self.client.get_sim_time()
-                    # 在躲避窗口内不覆盖速度/不允许攻击
-                    if self._evasive_until.get(rid, 0.0) > now_sim:
-                        self._policy_attack_intent[rid] = 0
-                        continue
-
-                    # 速度防抖：沿用你已有的 set_vehicle_vel + 记录器
-                    try:
-                        uid = self.client.set_vehicle_vel(rid, vcmd)
-                        self.recorder.mark_vel_cmd(rid, rate=vcmd.rate, direct=vcmd.direct, vz=vcmd.vz,
-                                                   sim_time=now_sim)
-                    except Exception as e:
-                        print(f"[BC] set_vehicle_vel({rid}) failed: {e}", flush=True)
-
-                    # 攻击意图记录（本秒有效）
-                    self._policy_attack_intent[rid] = 1 if int(a3) == 1 else 0
-
+                else:
+                    # 只有在有策略输出时，才切片并下发速度/攻击意图
+                    red_list = sorted(self.red_ids)
+                    for idx, rid in enumerate(red_list):
+                        a0, a1, a2, a3 = [float(act_full[idx * 4 + k]) for k in range(4)]
+                        vcmd = rflysim.Vel()
+                        vcmd.rate = max(0.0, float(a1))  # direct=速度大小 -> 接口的 rate
+                        vcmd.direct = float(a0) % 360.0  # rate=航向角   -> 接口的 direct
+                        vcmd.vz = float(a2)
+                        now_sim = self.client.get_sim_time()
+                        if self._evasive_until.get(rid, 0.0) > now_sim:
+                            self._policy_attack_intent[rid] = 0
+                            continue
+                        try:
+                            uid = self.client.set_vehicle_vel(rid, vcmd)
+                            self.recorder.mark_vel_cmd(rid, rate=vcmd.rate, direct=vcmd.direct, vz=vcmd.vz,
+                                                       sim_time=now_sim)
+                        except Exception as e:
+                            print(f"[BC] set_vehicle_vel({rid}) failed: {e}", flush=True)
+                        self._policy_attack_intent[rid] = 1 if int(a3) == 1 else 0
                 self._last_policy_sec = sim_sec
+
         except Exception as e:
             print("[BC] policy step failed:", e, flush=True)
 
@@ -1375,7 +1378,7 @@ class RedForceController:
             candidate_tids = list(visible_blue_targets)
 
             for rid in red_list:
-                if not self._policy_attack_intent.get(rid, 0):
+                if self._bc_mode in ("seq", "mlp") and (not self._policy_attack_intent.get(rid, 0)):
                     continue
                 # 躲避窗口 & 冷却 & 弹药检查
                 if self._evasive_until.get(rid, 0.0) > now_sim2:
