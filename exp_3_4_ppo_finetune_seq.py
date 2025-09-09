@@ -1,4 +1,4 @@
-# exp_3_4_ppo_finetune_seq.py (final patched)
+# exp_3_4_ppo_finetune_seq.py (seq-enabled)
 # -*- coding: utf-8 -*-
 import os, json, math, shutil
 import numpy as np
@@ -85,7 +85,6 @@ class PPOAgent:
         self.target_kl = target_kl
 
         # === 保存目录 vs 加载目录 ===
-        # bc_dir 作为“保存目录”；init_load_dir 作为“加载目录”（若为空则与保存目录一致）
         self.save_dir = bc_dir
         load_dir = init_load_dir or bc_dir
 
@@ -178,7 +177,6 @@ class PPOAgent:
         self.bc_kl_coef = bc_kl_coef
         self._update_steps = 0
 
-        # 若 online ckpt 存在则继续加载优化器等状态
         if ckpt is not None:
             try:
                 if "log_std" in ckpt:
@@ -202,12 +200,17 @@ class PPOAgent:
             )
         return y
 
-    # === 行为采样 ===
+    # === 便捷接口：初始化 RNN 隐状态 ===
+    def init_hidden(self, B=1):
+        return self.net.init_state(B, self.device)
+
+    # === 行为采样（支持传入/返回隐状态） ===
     @torch.no_grad()
     def act(self, obs64, tfeat, h=None, explore=True):
         """
-        obs64: np.float32[64]  (整帧)
+        obs64: np.float32[64]
         tfeat: np.float32[tdim]
+        h:     RNN 隐状态（来自上一次 act 的返回），或 None
         返回: a4_flat(16), V(float), logp(float), h1
         """
         x = np.concatenate([self.norm_obs(obs64), tfeat], axis=0)[None, None, :]  # [1,1,D]
@@ -240,7 +243,7 @@ class PPOAgent:
             a_full[col_idx] = float(fire_np[i])
         return a_full, float(V[0, 0].item()), float(logp), h1
 
-    # === 把 rollout(list) 组装成 batch(张量) + 计算 GAE/回报 ===
+    # === 把整段 traj 组装成 [B=1, T, D] 的批次 + 计算 GAE ===
     def _build_batch_from_traj(self, traj):
         """
         traj: list of dicts with keys:
@@ -251,49 +254,52 @@ class PPOAgent:
           - logp: float
           - rew: float
           - done: float(0/1)
+        返回：适配 RNN 的 batch（B=1, T=len(traj)）
         """
         if len(traj) == 0:
             raise ValueError("Empty trajectory")
+
         D = len(self.obs_cols) + self.tdim
         Cc = len(self.cont_cols)
-        N = len(traj)
-        obs = np.zeros((N, 1, D), np.float32)
-        act_c = np.zeros((N, 1, Cc), np.float32)
-        act_b = np.zeros((N, 1, len(self.bin_cols)), np.float32)
-        vals = np.zeros((N, 1), np.float32)
-        rews = np.zeros((N, 1), np.float32)
-        dones = np.zeros((N, 1), np.float32)
-        logp_old = np.zeros((N, 1), np.float32)
+        Cb = len(self.bin_cols)
+        T = len(traj)
+        B = 1
 
-        for i, step in enumerate(traj):
+        obs = np.zeros((B, T, D), np.float32)
+        act_c = np.zeros((B, T, Cc), np.float32)
+        act_b = np.zeros((B, T, Cb), np.float32)
+        vals = np.zeros((B, T), np.float32)
+        rews = np.zeros((B, T), np.float32)
+        dones = np.zeros((B, T), np.float32)
+        logp_old = np.zeros((B, T), np.float32)
+
+        for t in range(T):
+            step = traj[t]
             o64 = np.asarray(step["obs"], np.float32)
             tf = np.asarray(step["tfeat"], np.float32)
             x = np.concatenate([self.norm_obs(o64), tf], axis=0)
-            obs[i, 0, :] = x
+            obs[0, t, :] = x
             a16 = np.asarray(step["act"], np.float32)
-            # 连续位按 cont_idx 抽取
-            act_c[i, 0, :] = np.array([a16[j] for j in self.cont_idx], dtype=np.float32)
-            # 二值位按 bin_idx 抽取
-            act_b[i, 0, :] = np.array([a16[j] for j in self.bin_idx], dtype=np.float32)
-            vals[i, 0] = float(step.get("val", 0.0))
-            rews[i, 0] = float(step.get("rew", 0.0))
-            dones[i, 0] = float(step.get("done", 0.0))
-            logp_old[i, 0] = float(step.get("logp", 0.0))
+            act_c[0, t, :] = np.array([a16[j] for j in self.cont_idx], dtype=np.float32)
+            act_b[0, t, :] = np.array([a16[j] for j in self.bin_idx], dtype=np.float32)
+            vals[0, t] = float(step.get("val", 0.0))
+            rews[0, t] = float(step.get("rew", 0.0))
+            dones[0, t] = float(step.get("done", 0.0))
+            logp_old[0, t] = float(step.get("logp", 0.0))
 
-        # === GAE ===
+        # === GAE over time axis T ===
         adv = np.zeros_like(vals)
-        ret = np.zeros_like(vals)
         lastgaelam = 0.0
-        for t in reversed(range(N)):
-            if t == N - 1:
-                nextnonterm = 1.0 - float(dones[t, 0])
-                nextv = float(vals[t, 0])
+        for t in reversed(range(T)):
+            if t == T - 1:
+                nextnonterm = 1.0 - float(dones[0, t])
+                nextv = float(vals[0, t])
             else:
-                nextnonterm = 1.0 - float(dones[t + 1, 0])
-                nextv = float(vals[t + 1, 0])
-            delta = float(rews[t, 0]) + self.gamma * nextv * nextnonterm - float(vals[t, 0])
+                nextnonterm = 1.0 - float(dones[0, t + 1])
+                nextv = float(vals[0, t + 1])
+            delta = float(rews[0, t]) + self.gamma * nextv * nextnonterm - float(vals[0, t])
             lastgaelam = delta + self.gamma * self.lam * nextnonterm * lastgaelam
-            adv[t, 0] = lastgaelam
+            adv[0, t] = lastgaelam
         ret = adv + vals
 
         # 归一化优势
@@ -301,23 +307,20 @@ class PPOAgent:
         adv_std = adv.std() + 1e-8
         adv = (adv - adv_mean) / adv_std
 
-        # 张量化 + 旧 V 值（用于 value clip）
         batch = {
-            "obs": torch.from_numpy(obs),
-            "act_c": torch.from_numpy(act_c),
-            "act_b": torch.from_numpy(act_b),
-            "adv": torch.from_numpy(adv),
-            "ret": torch.from_numpy(ret),
-            "logp_old": torch.from_numpy(logp_old),
-            "val_old": torch.from_numpy(vals),
+            "obs": torch.from_numpy(obs),          # [1,T,D]
+            "act_c": torch.from_numpy(act_c),      # [1,T,Cc]
+            "act_b": torch.from_numpy(act_b),      # [1,T,Cb]
+            "adv": torch.from_numpy(adv),          # [1,T]
+            "ret": torch.from_numpy(ret),          # [1,T]
+            "logp_old": torch.from_numpy(logp_old),# [1,T]
+            "val_old": torch.from_numpy(vals),     # [1,T]
         }
-        # RNN 初始隐状态（零）
-        B = N
-        h0 = self.net.init_state(B, self.device)
-        batch["h0"] = h0
+        # 初始隐状态（零）
+        batch["h0"] = self.net.init_state(B=1, device=self.device)
         return batch
 
-    # === 训练入口：既支持 list(traj) 也支持 现成 batch ===
+    # === 训练入口 ===
     def update(self, data, bc_ref=None, epochs=4, minibatch=2):
         if isinstance(data, list):
             batch = self._build_batch_from_traj(data)
@@ -325,83 +328,95 @@ class PPOAgent:
             batch = data
         out = self._update_from_batch(batch, bc_ref=bc_ref, epochs=epochs, minibatch=minibatch)
 
-        # 退火（按更新步推进）
+        # 退火
         self._update_steps += 1
         t = min(1.0, self._update_steps / max(1, self.total_updates_for_anneal))
         for pg in self.opt.param_groups:
-            pg["lr"] = self.base_lr * (1.0 - 0.8 * t)  # lr: base -> 0.2*base
-        # 熵系数从初值退到 ent_coef_min
+            pg["lr"] = self.base_lr * (1.0 - 0.8 * t)
         self.ent_coef = self.ent_coef * (1.0 - t) + self.ent_coef_min * t
         return out
 
     def _update_from_batch(self, batch, bc_ref=None, epochs=4, minibatch=2):
-        N = batch["obs"].shape[0]
-        idx_all = np.arange(N)
+        """
+        支持 [B=1, T, D] 的整段序列训练；按时间轴把 T 均分为 `minibatch` 份做截断 BPTT。
+        """
+        obs_all = batch["obs"].to(self.device)           # [1,T,D]
+        act_c_all = batch["act_c"].to(self.device)       # [1,T,Cc]
+        act_b_all = batch["act_b"].to(self.device)       # [1,T,Cb]
+        adv_all = batch["adv"].to(self.device)           # [1,T]
+        ret_all = batch["ret"].to(self.device)           # [1,T]
+        logp_old_all = batch["logp_old"].to(self.device) # [1,T]
+        v_old_all = batch["val_old"].to(self.device)     # [1,T]
 
-        # 统计 KL 以便自适应系数
+        B, T, D = obs_all.shape
+        assert B == 1, "当前实现默认 B=1（整段 episode 作为一条序列）"
+
+        # 将时间轴分成 minibatch 份
+        splits = np.array_split(np.arange(T), max(1, minibatch))
         kl_vals = []
 
         for _ in range(epochs):
-            np.random.shuffle(idx_all)
-            for split in np.array_split(idx_all, minibatch):
-                obs = batch["obs"][split].to(self.device)  # [B,1,D]
-                act_c = batch["act_c"][split].to(self.device)  # [B,1,Cc]
-                act_b = batch["act_b"][split].to(self.device)  # [B,1,Cb]
-                adv = batch["adv"][split].to(self.device)  # [B,1]
-                ret = batch["ret"][split].to(self.device)  # [B,1]
-                logp_old = batch["logp_old"][split].to(self.device)  # [B,1]
-                v_old = batch["val_old"][split].to(self.device)[:, 0]  # [B]
+            # 每个 epoch 打乱时间切块顺序
+            np.random.shuffle(splits)
+            for idxs in splits:
+                t0 = int(idxs[0]); t1 = int(idxs[-1]) + 1
+                obs = obs_all[:, t0:t1, :]          # [1,τ,D]
+                act_c = act_c_all[:, t0:t1, :]      # [1,τ,Cc]
+                act_b = act_b_all[:, t0:t1, :]      # [1,τ,Cb]
+                adv = adv_all[:, t0:t1]             # [1,τ]
+                ret = ret_all[:, t0:t1]             # [1,τ]
+                logp_old = logp_old_all[:, t0:t1]   # [1,τ]
+                v_old = v_old_all[:, t0:t1]         # [1,τ]
 
-                h0 = batch["h0"]
-                if isinstance(h0, tuple):  # LSTM
-                    h0 = (h0[0][:, split].to(self.device), h0[1][:, split].to(self.device))
-                else:  # GRU
-                    h0 = h0[:, split].to(self.device)
+                # 截断 BPTT：每个切块从零隐状态开始（简单稳妥）
+                h0 = self.net.init_state(B=1, device=self.device)
 
-                out, V, _ = self.net(obs, h0)
-                mu = out["cont"][:, 0, :]  # [B,Cc]
-                logits = out["bin_logits"][:, 0, :]  # [B,Cb]
-                std = self.log_std.exp().unsqueeze(0)  # [1,Cc]
+                out, V, _ = self.net(obs, h0)               # out: [1,τ,*] ; V: [1,τ]
+                mu = out["cont"][:, :, :]                   # [1,τ,Cc]
+                logits = out["bin_logits"][:, :, :]         # [1,τ,Cb]
+                std = self.log_std.exp().unsqueeze(0).unsqueeze(0)  # [1,1,Cc]
 
-                # 连续对数似然
+                # 连续对数似然（逐时刻求和掉动作维）
                 normal = torch.distributions.Normal(mu, std)
-                logp_cont = normal.log_prob(act_c[:, 0, :]).sum(dim=-1, keepdim=True)  # [B,1]
+                logp_cont = normal.log_prob(act_c).sum(dim=-1)  # [1,τ]
 
                 # 二值对数似然
                 bern = torch.distributions.Bernoulli(logits=logits)
-                logp_fire = bern.log_prob(act_b[:, 0, :]).sum(dim=-1, keepdim=True)  # [B,1]
+                logp_fire = bern.log_prob(act_b).sum(dim=-1)    # [1,τ]
 
-                logp = logp_cont + logp_fire
-                ratio = (logp - logp_old).exp()
+                logp = logp_cont + logp_fire                    # [1,τ]
+                ratio = (logp - logp_old).exp()                 # [1,τ]
 
-                # PPO-clip
+                # PPO-clip（逐时刻）
                 obj1 = ratio * adv
                 obj2 = torch.clamp(ratio, 1.0 - self.clip_ratio, 1.0 + self.clip_ratio) * adv
                 pg_loss = -torch.min(obj1, obj2).mean()
 
-                # Value loss with clipping
-                v_pred = V[:, 0]
+                # Value loss with clipping（逐时刻）
+                v_pred = V                                      # [1,τ]
                 v_clipped = v_old + (v_pred - v_old).clamp(-self.v_clip, self.v_clip)
-                v_loss1 = F.mse_loss(v_pred, ret[:, 0], reduction="none")
-                v_loss2 = F.mse_loss(v_clipped, ret[:, 0], reduction="none")
+                v_loss1 = F.mse_loss(v_pred, ret, reduction="none")
+                v_loss2 = F.mse_loss(v_clipped, ret, reduction="none")
                 v_loss = torch.max(v_loss1, v_loss2).mean()
 
-                # 熵（鼓励探索）：连续近似用 log_std，总熵加上 Bernoulli 熵
-                ent = (torch.log(std).sum() + bern.entropy().mean())
+                # 熵（连续 + Bernoulli）
+                ent_cont = torch.log(std).sum()                 # 常数项（按动作维），对每个切片仅计一次
+                ent_bin = bern.entropy().mean()                 # [1,τ,Cb] -> 标量
+                ent = ent_cont + ent_bin
 
-                # 额外 KL 到 BC 参考（单步近似）
+                # KL 到参考策略（逐时刻平均）
                 with torch.no_grad():
                     ref_out, _, _ = (bc_ref or self.ref)(obs, h0)
-                mu_ref = ref_out["cont"][:, 0, :]
-                logits_ref = ref_out["bin_logits"][:, 0, :]
+                mu_ref = ref_out["cont"][:, :, :]
+                logits_ref = ref_out["bin_logits"][:, :, :]
                 std_ref = std.detach()
-                # KL(N0||N1) = sum(log(s1/s0) + (s0^2+(m0-m1)^2)/(2*s1^2) - 1/2)
+
                 kl_cont = (
                     torch.log(std / std_ref)
                     + (std_ref.pow(2) + (mu - mu_ref).pow(2)) / (2 * std.pow(2))
                     - 0.5
-                ).sum(dim=-1).mean()
-                # Bernoulli KL
+                ).sum(dim=-1).mean()  # sum over action dim, mean over B,T
+
                 p = torch.sigmoid(logits)
                 q = torch.sigmoid(logits_ref)
                 kl_bin = (
@@ -418,11 +433,9 @@ class PPOAgent:
                 nn.utils.clip_grad_norm_(list(self.net.parameters()) + [self.log_std], self.max_grad_norm)
                 self.opt.step()
 
-                # 限制 std 范围
                 with torch.no_grad():
                     self.log_std.clamp_(math.log(1e-3), math.log(1.0))
 
-        # epoch 结束后根据 KL 自适应调节 BC KL 系数
         if len(kl_vals) > 0:
             kl_mean = torch.stack(list(kl_vals)).mean().item()
             if kl_mean > 1.5 * self.target_kl:
@@ -430,10 +443,11 @@ class PPOAgent:
             elif kl_mean < 0.5 * self.target_kl:
                 self.bc_kl_coef *= 0.7
             self.bc_kl_coef = float(np.clip(self.bc_kl_coef, 1e-4, 1.0))
+        else:
+            kl_mean = 0.0
 
-        # 返回一些监控指标（可选）
         return {
-            "kl_mean": float(kl_mean) if len(kl_vals) > 0 else 0.0,
+            "kl_mean": float(kl_mean),
             "bc_kl_coef": float(self.bc_kl_coef),
             "updates": int(self._update_steps),
         }

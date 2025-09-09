@@ -39,9 +39,9 @@ DESTROYED_FLAG = "DAMAGE_STATE_DESTROYED"
 RED_IDS = [10091, 10084, 10085, 10086]
 
 AMMO_MAX = 8
-ATTACK_COOLDOWN_SEC = 2.0
+ATTACK_COOLDOWN_SEC = 1.5
 SCAN_INTERVAL_SEC = 0.1
-LOCK_SEC = 50.0
+LOCK_SEC = 55.0
 BLUE_SIDE_CODE = 2
 DESTROY_CODES = {1}
 
@@ -376,6 +376,7 @@ class BCSeqPredictor64x16:
 class RLRecorder:
     def __init__(self):
         self.buffer = []
+               # ...（下略：与原版一致，无改动）
         self.last_action = {}
         self.attack_events = defaultdict(list)
         self.last_vel_cmd = {}
@@ -411,11 +412,14 @@ class RLRecorder:
         def nz(x, default):
             try: return float(x)
             except Exception: return default
+
         if vcmd and (sim_sec - int(vcmd["t"])) <= 1:
-            rate_cmd = nz(vcmd.get("rate"), 0.0)
-            direct_cmd = nz(vcmd.get("direct"), 0.0)
+            speed_cmd = nz(vcmd.get("rate"), 0.0)  # 速度
+            heading_cmd = nz(vcmd.get("direct"), 0.0) % 360.0  # 航向角
             vz_cmd = nz(vcmd.get("vz"), nz(getattr(pos_meas, "z", None), 0.0))
-            return [rate_cmd % 360.0, direct_cmd, vz_cmd, int(attack_flag)]
+            # 约定的 act4: [heading(角度), speed(速度), vz, fire]
+            return [heading_cmd, speed_cmd, vz_cmd, int(attack_flag)]
+
         vx = getattr(vel_meas, "vx", None) if vel_meas else None
         vy = getattr(vel_meas, "vy", None) if vel_meas else None
         direct_calc, rate_calc = _direct_rate_from_vx_vy(vx, vy)
@@ -489,8 +493,8 @@ class RedForceController:
         self.MISSILE_BEARING_THRESH_DEG = 25.0
         self.EVASIVE_TURN_DEG = 90.0
         self.EVASIVE_SPEED_MIN = 220.0
-        self.EVASIVE_DURATION_SEC = 10.0
-        self.EVASIVE_COOLDOWN_SEC = 5.0
+        self.EVASIVE_DURATION_SEC = 30.0
+        self.EVASIVE_COOLDOWN_SEC = 2.0
         self._missile_last_dist = {}
         self._missile_last = {}
         self._evasive_until = {}
@@ -518,6 +522,9 @@ class RedForceController:
         self._policy_attack_intent = {int(r): 0 for r in red_ids}
         # 本秒是否已跑过策略（用于“每秒只下发一次”）
         self._last_policy_sec = -1
+
+        # === 新增：初始化 GRU 隐状态（B=1） ===
+        self._ppo_h = None
 
         for rid in red_ids:
             try:
@@ -789,12 +796,13 @@ class RedForceController:
                     self.traj[-1]["rew"] = float(rew)
                     self._last_counts = {"blue": blue_k, "red": red_k}
 
-                # 本秒动作
+                # 本秒动作 —— 关键改动：传入/更新 GRU 隐状态
                 obs64 = _np.asarray(self.recorder.latest_obs_vec, dtype=_np.float32)
                 t_norm = (sim_sec - 0.0) / max(1.0, 300.0)
                 tfeat_full = _np.array([t_norm, math.sin(2*math.pi*t_norm), math.cos(2*math.pi*t_norm)], dtype=_np.float32)
                 tfeat = tfeat_full[: self.ppo.tdim]
-                a_full, V, logp, _ = self.ppo.act(obs64, tfeat, h=None, explore=True)
+                a_full, V, logp, h1 = self.ppo.act(obs64, tfeat, h=self._ppo_h, explore=True)
+                self._ppo_h = h1
 
                 # 下发速度 + 设置“意图位”
                 red_list = sorted(self.red_ids)
