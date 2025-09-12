@@ -176,7 +176,10 @@ class PPOAgent:
         self.total_updates_for_anneal = 200
         self.bc_kl_coef = bc_kl_coef
         self._update_steps = 0
-
+        # === 日志与曲线输出目录 ===
+        self.plots_dir = os.path.join(self.save_dir, "plots")
+        os.makedirs(self.plots_dir, exist_ok=True)
+        self.train_log_csv = os.path.join(self.save_dir, "train_log.csv")
         if ckpt is not None:
             try:
                 if "log_std" in ckpt:
@@ -188,6 +191,49 @@ class PPOAgent:
                 self._update_steps = ckpt.get("update_steps", self._update_steps)
             except Exception:
                 pass
+
+
+
+    def _save_epoch_plot(self, epoch_stats, step_idx: int):
+        """
+        把每个 epoch 的损失曲线画到一张图里：total / policy / value / entropy。
+        返回保存的路径；若 matplotlib 不可用则返回 None。
+        """
+        try:
+            import matplotlib
+            matplotlib.use("Agg")
+            import matplotlib.pyplot as plt
+            import numpy as _np
+        except Exception:
+            return None
+
+        if not epoch_stats:
+            return None
+
+        x = _np.arange(1, len(epoch_stats) + 1, dtype=_np.int32)
+        tot = _np.array([s["loss_total"] for s in epoch_stats], dtype=float)
+        pg  = _np.array([s["pg_loss"]    for s in epoch_stats], dtype=float)
+        vl  = _np.array([s["v_loss"]     for s in epoch_stats], dtype=float)
+        ent = _np.array([s["entropy"]    for s in epoch_stats], dtype=float)
+
+        plt.figure(figsize=(8, 5), dpi=120)
+        plt.plot(x, tot, label="total_loss")
+        plt.plot(x, pg,  label="policy_loss")
+        plt.plot(x, vl,  label="value_loss")
+        plt.plot(x, ent, label="entropy")
+        plt.xlabel("Epoch")
+        plt.ylabel("Loss / Entropy")
+        plt.title(f"PPO Update #{step_idx} Loss Curves")
+        plt.grid(True, alpha=0.3)
+        plt.legend(loc="best")
+        save_path = os.path.join(self.plots_dir, f"update_{int(step_idx):05d}.png")
+        try:
+            plt.tight_layout()
+        except Exception:
+            pass
+        plt.savefig(save_path)
+        plt.close()
+        return save_path
 
     # === 归一化/反归一化 ===
     def norm_obs(self, o):
@@ -339,14 +385,18 @@ class PPOAgent:
     def _update_from_batch(self, batch, bc_ref=None, epochs=4, minibatch=2):
         """
         支持 [B=1, T, D] 的整段序列训练；按时间轴把 T 均分为 `minibatch` 份做截断 BPTT。
+        训练时：
+          - 每个 epoch 统计/打印：pg_loss, v_loss, entropy, total_loss, approx_kl(old->new), clipfrac, ev, kl_ref
+          - 保存一张损失曲线图到 ./bc_out_seq/plots/update_XXXXX.png
+          - 追加数值到 ./bc_out_seq/train_log.csv
         """
-        obs_all = batch["obs"].to(self.device)           # [1,T,D]
-        act_c_all = batch["act_c"].to(self.device)       # [1,T,Cc]
-        act_b_all = batch["act_b"].to(self.device)       # [1,T,Cb]
-        adv_all = batch["adv"].to(self.device)           # [1,T]
-        ret_all = batch["ret"].to(self.device)           # [1,T]
-        logp_old_all = batch["logp_old"].to(self.device) # [1,T]
-        v_old_all = batch["val_old"].to(self.device)     # [1,T]
+        obs_all = batch["obs"].to(self.device)  # [1,T,D]
+        act_c_all = batch["act_c"].to(self.device)  # [1,T,Cc]
+        act_b_all = batch["act_b"].to(self.device)  # [1,T,Cb]
+        adv_all = batch["adv"].to(self.device)  # [1,T]
+        ret_all = batch["ret"].to(self.device)  # [1,T]
+        logp_old_all = batch["logp_old"].to(self.device)  # [1,T]
+        v_old_all = batch["val_old"].to(self.device)  # [1,T]
 
         B, T, D = obs_all.shape
         assert B == 1, "当前实现默认 B=1（整段 episode 作为一条序列）"
@@ -354,26 +404,40 @@ class PPOAgent:
         # 将时间轴分成 minibatch 份
         splits = np.array_split(np.arange(T), max(1, minibatch))
         kl_vals = []
+        epoch_stats = []
 
-        for _ in range(epochs):
+        def _explained_variance(y_pred, y_true):
+            # y_*: [1,T]
+            y_pred = y_pred.detach()
+            y_true = y_true.detach()
+            var_y = torch.var(y_true)
+            if float(var_y) < 1e-12:
+                return 0.0
+            return float(1.0 - torch.var(y_true - y_pred) / (var_y + 1e-12))
+
+        for e in range(epochs):
             # 每个 epoch 打乱时间切块顺序
             np.random.shuffle(splits)
+
+            agg = dict(pg=[], v=[], ent=[], tot=[], kl_ref=[], kl_approx=[], clipfrac=[])
+
             for idxs in splits:
-                t0 = int(idxs[0]); t1 = int(idxs[-1]) + 1
-                obs = obs_all[:, t0:t1, :]          # [1,τ,D]
-                act_c = act_c_all[:, t0:t1, :]      # [1,τ,Cc]
-                act_b = act_b_all[:, t0:t1, :]      # [1,τ,Cb]
-                adv = adv_all[:, t0:t1]             # [1,τ]
-                ret = ret_all[:, t0:t1]             # [1,τ]
-                logp_old = logp_old_all[:, t0:t1]   # [1,τ]
-                v_old = v_old_all[:, t0:t1]         # [1,τ]
+                t0 = int(idxs[0]);
+                t1 = int(idxs[-1]) + 1
+                obs = obs_all[:, t0:t1, :]  # [1,τ,D]
+                act_c = act_c_all[:, t0:t1, :]  # [1,τ,Cc]
+                act_b = act_b_all[:, t0:t1, :]  # [1,τ,Cb]
+                adv = adv_all[:, t0:t1]  # [1,τ]
+                ret = ret_all[:, t0:t1]  # [1,τ]
+                logp_old = logp_old_all[:, t0:t1]  # [1,τ]
+                v_old = v_old_all[:, t0:t1]  # [1,τ]
 
                 # 截断 BPTT：每个切块从零隐状态开始（简单稳妥）
                 h0 = self.net.init_state(B=1, device=self.device)
 
-                out, V, _ = self.net(obs, h0)               # out: [1,τ,*] ; V: [1,τ]
-                mu = out["cont"][:, :, :]                   # [1,τ,Cc]
-                logits = out["bin_logits"][:, :, :]         # [1,τ,Cb]
+                out, V, _ = self.net(obs, h0)  # out: [1,τ,*] ; V: [1,τ]
+                mu = out["cont"][:, :, :]  # [1,τ,Cc]
+                logits = out["bin_logits"][:, :, :]  # [1,τ,Cb]
                 std = self.log_std.exp().unsqueeze(0).unsqueeze(0)  # [1,1,Cc]
 
                 # 连续对数似然（逐时刻求和掉动作维）
@@ -382,10 +446,10 @@ class PPOAgent:
 
                 # 二值对数似然
                 bern = torch.distributions.Bernoulli(logits=logits)
-                logp_fire = bern.log_prob(act_b).sum(dim=-1)    # [1,τ]
+                logp_fire = bern.log_prob(act_b).sum(dim=-1)  # [1,τ]
 
-                logp = logp_cont + logp_fire                    # [1,τ]
-                ratio = (logp - logp_old).exp()                 # [1,τ]
+                logp = logp_cont + logp_fire  # [1,τ]
+                ratio = (logp - logp_old).exp()  # [1,τ]
 
                 # PPO-clip（逐时刻）
                 obj1 = ratio * adv
@@ -393,15 +457,15 @@ class PPOAgent:
                 pg_loss = -torch.min(obj1, obj2).mean()
 
                 # Value loss with clipping（逐时刻）
-                v_pred = V                                      # [1,τ]
+                v_pred = V
                 v_clipped = v_old + (v_pred - v_old).clamp(-self.v_clip, self.v_clip)
                 v_loss1 = F.mse_loss(v_pred, ret, reduction="none")
                 v_loss2 = F.mse_loss(v_clipped, ret, reduction="none")
                 v_loss = torch.max(v_loss1, v_loss2).mean()
 
                 # 熵（连续 + Bernoulli）
-                ent_cont = torch.log(std).sum()                 # 常数项（按动作维），对每个切片仅计一次
-                ent_bin = bern.entropy().mean()                 # [1,τ,Cb] -> 标量
+                ent_cont = torch.log(std).sum()  # 常数项（按动作维），对每个切片仅计一次
+                ent_bin = bern.entropy().mean()
                 ent = ent_cont + ent_bin
 
                 # KL 到参考策略（逐时刻平均）
@@ -412,17 +476,18 @@ class PPOAgent:
                 std_ref = std.detach()
 
                 kl_cont = (
-                    torch.log(std / std_ref)
-                    + (std_ref.pow(2) + (mu - mu_ref).pow(2)) / (2 * std.pow(2))
-                    - 0.5
-                ).sum(dim=-1).mean()  # sum over action dim, mean over B,T
+                        torch.log(std / std_ref)
+                        + (std_ref.pow(2) + (mu - mu_ref).pow(2)) / (2 * std.pow(2))
+                        - 0.5
+                ).sum(dim=-1).mean()
 
                 p = torch.sigmoid(logits)
                 q = torch.sigmoid(logits_ref)
                 kl_bin = (
-                    p * torch.log((p + 1e-8) / (q + 1e-8))
-                    + (1 - p) * torch.log(((1 - p) + 1e-8) / ((1 - q) + 1e-8))
+                        p * torch.log((p + 1e-8) / (q + 1e-8))
+                        + (1 - p) * torch.log(((1 - p) + 1e-8) / ((1 - q) + 1e-8))
                 ).sum(dim=-1).mean()
+
                 kl_total = kl_cont + kl_bin
                 kl_vals.append(kl_total.detach().cpu())
 
@@ -436,6 +501,50 @@ class PPOAgent:
                 with torch.no_grad():
                     self.log_std.clamp_(math.log(1e-3), math.log(1.0))
 
+                # ==== 统计信息（本 minibatch）====
+                with torch.no_grad():
+                    approx_kl = torch.mean(torch.abs(logp_old - logp)).item()
+                    clipfrac = torch.mean(((ratio - 1.0).abs() > self.clip_ratio).float()).item()
+                    agg["pg"].append(float(pg_loss.item()))
+                    agg["v"].append(float(v_loss.item()))
+                    agg["ent"].append(float(ent.item()))
+                    agg["tot"].append(float(loss.item()))
+                    agg["kl_ref"].append(float(kl_total.item()))
+                    agg["kl_approx"].append(float(approx_kl))
+                    agg["clipfrac"].append(float(clipfrac))
+
+            # ==== epoch 级聚合 ====
+            with torch.no_grad():
+                # 用全序列估计 EV
+                h0_all = self.net.init_state(B=1, device=self.device)
+                _, V_all, _ = self.net(obs_all, h0_all)  # [1,T]
+                ev = _explained_variance(V_all, ret_all)
+
+            ep_stat = {
+                "epoch": int(e + 1),
+                "pg_loss": float(np.mean(agg["pg"])) if agg["pg"] else 0.0,
+                "v_loss": float(np.mean(agg["v"])) if agg["v"] else 0.0,
+                "entropy": float(np.mean(agg["ent"])) if agg["ent"] else 0.0,
+                "loss_total": float(np.mean(agg["tot"])) if agg["tot"] else 0.0,
+                "kl_ref": float(np.mean(agg["kl_ref"])) if agg["kl_ref"] else 0.0,
+                "approx_kl": float(np.mean(agg["kl_approx"])) if agg["kl_approx"] else 0.0,
+                "clipfrac": float(np.mean(agg["clipfrac"])) if agg["clipfrac"] else 0.0,
+                "ev": float(ev),
+            }
+            epoch_stats.append(ep_stat)
+
+            # 控制台打印每个 epoch 的指标
+            print(
+                "[PPO][epoch {}/{}] total={:.4f} | pg={:.4f} v={:.4f} ent={:.4f} | "
+                "kl_ref={:.4f} kl≈={:.4f} clipfrac={:.2%} ev={:.3f}".format(
+                    ep_stat["epoch"], epochs,
+                    ep_stat["loss_total"], ep_stat["pg_loss"], ep_stat["v_loss"], ep_stat["entropy"],
+                    ep_stat["kl_ref"], ep_stat["approx_kl"], ep_stat["clipfrac"], ep_stat["ev"]
+                ),
+                flush=True
+            )
+
+        # === 动态调 KL 系数 ===
         if len(kl_vals) > 0:
             kl_mean = torch.stack(list(kl_vals)).mean().item()
             if kl_mean > 1.5 * self.target_kl:
@@ -446,10 +555,39 @@ class PPOAgent:
         else:
             kl_mean = 0.0
 
+        # === 画图 & 记录 CSV ===
+        plot_path = self._save_epoch_plot(epoch_stats, self._update_steps + 1)
+
+        try:
+            need_head = not os.path.exists(self.train_log_csv)
+            with open(self.train_log_csv, "a", newline="", encoding="utf-8") as f:
+                import csv as _csv, time as _time
+                w = _csv.writer(f)
+                if need_head:
+                    w.writerow([
+                        "time", "update_idx", "epoch", "total_loss", "pg_loss", "v_loss", "entropy",
+                        "kl_ref", "approx_kl", "clipfrac", "ev", "lr", "ent_coef", "bc_kl_coef"
+                    ])
+                lr_now = self.opt.param_groups[0]["lr"]
+                for s in epoch_stats:
+                    w.writerow([
+                        int(_time.time()), int(self._update_steps + 1), int(s["epoch"]),
+                        float(s["loss_total"]), float(s["pg_loss"]), float(s["v_loss"]), float(s["entropy"]),
+                        float(s["kl_ref"]), float(s["approx_kl"]), float(s["clipfrac"]), float(s["ev"]),
+                        float(lr_now), float(self.ent_coef), float(self.bc_kl_coef)
+                    ])
+        except Exception:
+            pass
+
+        # 返回更多信息，便于外部打印
         return {
             "kl_mean": float(kl_mean),
             "bc_kl_coef": float(self.bc_kl_coef),
             "updates": int(self._update_steps),
+            "epoch_stats": epoch_stats,
+            "plot_path": plot_path,
+            "lr": float(self.opt.param_groups[0]["lr"]),
+            "ent_coef": float(self.ent_coef),
         }
 
     def save(self, out_dir=None):

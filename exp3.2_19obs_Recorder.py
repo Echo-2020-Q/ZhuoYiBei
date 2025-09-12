@@ -50,9 +50,21 @@ DESTROY_CODES = {1}
 
 vel_0 = rflysim.Vel()
 vel_0.vz = 150
-vel_0.rate = 200
-vel_0.direct = 90
 
+# vel_0.rate = 200
+# vel_0.direct = 90
+
+# ====== 新增：开局定速向东 + 定时提速配置 ======
+FULL_SPEED = 200           # 全速
+EAST_HEADING_DEG = 90      # 向东
+BOOST_AFTER_SEC = 120.0     # 多少仿真秒后把另外三架提到全速
+# 初始速度（除 10085 外三架一开始较慢）
+INITIAL_SPEEDS = {
+  10085: 200,  # 指定：10085 开局即全速
+  10091: 80,
+  10084: 100,
+  10086: 80,
+}
 BOUNDARY_RECT = {
     "min_x": 101.07326442811694,
     "max_x": 103.08242360888715,
@@ -63,6 +75,7 @@ JAM_CENTER = (101.96786384206956, 40.2325)
 JAM_EDGE_PT = (101.84516211958464, 40.2325)
 JAM_RADIUS_M = None
 BLUE_DIST_CAP = 70000.0
+
 
 # ==================== 通用工具函数 ====================
 def _bearing_deg_from_A_to_B(lonA, latA, lonB, latB):
@@ -458,11 +471,11 @@ class RedForceController:
         self._last_approach_flag = {}           # rid -> 上次是否判定为“接近”
 
         # --- 躲避导弹相关常量 ---
-        self.MISSILE_THREAT_DIST_M = 50000.0      # 威胁距离阈值
+        self.MISSILE_THREAT_DIST_M = 75000.0      # 威胁距离阈值
         self.MISSILE_BEARING_THRESH_DEG = 25.0   # 视线角阈值：导弹航向与“导弹->红机连线”夹角小于该值视为“冲向我”
-        self.EVASIVE_TURN_DEG = 90.0             # 机动：相对导弹方向 90°
+        self.EVASIVE_TURN_DEG = 30.0             # 机动：相对导弹方向 90°
         self.EVASIVE_SPEED_MIN = 220.0           # 躲避时最低水平速度（m/s），会与当前速度取 max
-        self.EVASIVE_DURATION_SEC = 10.0          # 每次躲避持续时长（限制攻击）
+        self.EVASIVE_DURATION_SEC = 30.0          # 每次躲避持续时长（限制攻击）
         self.EVASIVE_COOLDOWN_SEC = 5.0          # 躲避冷却：避免频繁反复机动
 
         # --- 躲避导弹状态 ---
@@ -472,11 +485,12 @@ class RedForceController:
         self._evasive_until = {}                 # rid -> 时间戳（在此之前禁止开火）
         self._last_evasive_time = {}             # rid -> 最近一次触发躲避的时间戳
 
+        self._init_speed_done = False
+        self._boost_done = {rid: False for rid in self.red_ids}
+
         # --- 全灭后延迟结束（20s） ---
         self._end_grace_until = None   # None 或 墙钟时间戳（time.time()）
         self._end_reason = ""
-
-
 
         for rid in red_ids:
             try:
@@ -484,13 +498,29 @@ class RedForceController:
                 print(f"[Red] Radar ON for {rid}, uid={uid}", flush=True)
             except Exception as e:
                 print(f"[Red] enable_radar({rid}) failed: {e}", flush=True)
+
+        # 开局定速向东（10085 全速，其他 100/100/80）
+        try:
+            t0 = self.client.get_sim_time()
+        except Exception:
+            t0 = 0.0
+
+        for rid in sorted(self.red_ids):
+            spd = float(INITIAL_SPEEDS.get(int(rid), 100.0))
+            vcmd = rflysim.Vel()
+            # 你的环境：vcmd.rate = 水平速度标量；vcmd.direct = 航向角(0=北, 顺时针)
+            vcmd.rate = spd
+            vcmd.direct = EAST_HEADING_DEG
+            vcmd.vz = vel_0.vz
             try:
-                vuid = self.client.set_vehicle_vel(rid, vel_0)
-                print(f"[Red] vel set for {rid}, uid={vuid}", flush=True)
-                time.sleep(0.2)
-                print(client.get_command_status(vuid))
+                uid = self.client.set_vehicle_vel(int(rid), vcmd)
+                # 记录“最近一次命令”，便于 act4 回填
+                self.recorder.mark_vel_cmd(int(rid), rate=vcmd.rate, direct=vcmd.direct, vz=vcmd.vz, sim_time=t0)
+                print(f"[INIT-SPEED] rid={rid} -> speed={vcmd.rate} heading={vcmd.direct}° vz={vcmd.vz}", flush=True)
             except Exception as e:
-                print(f"[Red] set_vehicle_vel({rid}) failed: {e}", flush=True)
+                print(f"[INIT-SPEED] set_vehicle_vel({rid}) failed: {e}", flush=True)
+
+        self._init_speed_done = True
 
     # ---- 内部工具 ----
     def _estimate_msl_heading_speed(self, mid, lon_now, lat_now, t_now):
@@ -674,6 +704,41 @@ class RedForceController:
         self._update_destroyed_from_situ()
         sim_t = self.client.get_sim_time()
         sim_sec = int(sim_t)
+
+        # 到点把非 10085 的三架提到全速（保持向东）
+        if self._init_speed_done and (sim_t >= BOOST_AFTER_SEC):
+            try:
+                for rid in sorted(self.red_ids):
+                    if int(rid) == 10085:
+                        self._boost_done[rid] = True  # 10085 一开始就是全速
+                        continue
+                    if self._boost_done.get(rid, False):
+                        continue
+
+                    vcmd = rflysim.Vel()
+                    vcmd.rate = float(FULL_SPEED)
+                    vcmd.direct = EAST_HEADING_DEG
+                    # vz 保持当前测到的垂直速度（也可改成固定 vel_0.vz）
+                    try:
+                        v_meas = self.client.get_vehicle_vel().get(int(rid))
+                        vcmd.vz = getattr(v_meas, "vz", vel_0.vz)
+                    except Exception:
+                        vcmd.vz = vel_0.vz
+
+                    try:
+                        uid = self.client.set_vehicle_vel(int(rid), vcmd)
+                        self.recorder.mark_vel_cmd(int(rid), rate=vcmd.rate, direct=vcmd.direct, vz=vcmd.vz,
+                                                   sim_time=sim_t)
+                        self._boost_done[rid] = True
+                        print(
+                            f"[BOOST] t={sim_t:.1f}s rid={rid} -> speed={vcmd.rate} heading={vcmd.direct}° vz={vcmd.vz}",
+                            flush=True)
+                    except Exception as e:
+                        print(f"[BOOST] set_vehicle_vel({rid}) failed: {e}", flush=True)
+            except Exception as e:
+                print("[BOOST] block failed:", e, flush=True)
+
+
         self._score_counter = getattr(self, "_score_counter", 0) + 1
         if self._score_counter % 5 == 0:
             try:

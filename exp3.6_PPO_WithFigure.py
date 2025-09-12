@@ -1269,8 +1269,33 @@ def run_one_episode(client, plan_id, out_csv_path, max_wall_time_sec=360, min_wa
                     red_ctrl.traj[-1]["rew"] += float(final_rew)
                     red_ctrl.traj[-1]["done"] = 1.0
                 out = red_ctrl.ppo.update(red_ctrl.traj, epochs=4, minibatch=2)
-                print("[PPO] update:", out, flush=True)
+                # 逐 epoch 展开打印（update 内部也会打印一次，这里让 manifest 更完整）
+                try:
+                    stats = out.get("epoch_stats", []) or []
+                    for ei, s in enumerate(stats, 1):
+                        print(
+                            "[PPO][epoch {}/{}] total={:.4f} | pg={:.4f} v={:.4f} ent={:.4f} | "
+                            "kl_ref={:.4f} kl≈={:.4f} clipfrac={:.2%} ev={:.3f}".format(
+                                ei, len(stats),
+                                s["loss_total"], s["pg_loss"], s["v_loss"], s["entropy"],
+                                s["kl_ref"], s["approx_kl"], s["clipfrac"], s["ev"]
+                            ),
+                            flush=True
+                        )
+                    print(
+                        "[PPO] KL_mean={:.4f} bc_kl_coef={:.5f} updates={} lr={:.2e} ent_coef={:.2e}".format(
+                            float(out.get("kl_mean", 0.0)), float(out.get("bc_kl_coef", 0.0)),
+                            int(out.get("updates", 0)), float(out.get("lr", 0.0)), float(out.get("ent_coef", 0.0))
+                        ),
+                        flush=True
+                    )
+                    if out.get("plot_path"):
+                        print(f"[PPO] Saved loss curves to: {out['plot_path']}", flush=True)
+                except Exception:
+                    print("[PPO] update:", out, flush=True)
+
                 red_ctrl.ppo.save()  # -> ./bc_out_seq/seq_policy.pt.online
+
         except Exception as e:
             print("[PPO] online update/save failed:", e, flush=True)
 
