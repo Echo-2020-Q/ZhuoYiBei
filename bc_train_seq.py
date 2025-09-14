@@ -187,7 +187,7 @@ class RNNPolicy(nn.Module):
             out["bin_logits"] = self.head_bin(Z)     # B,T,Cb
         return out, h_new
 
-# ---------------- train ----------------
+# ---------------- train ----------------训练命令：python bc_train_seq.py --data_glob "runs/20250913_003049/*.csv"
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--data_glob", required=True)

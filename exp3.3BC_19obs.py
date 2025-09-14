@@ -16,9 +16,7 @@
 #  13  : 到干扰区边界的有符号距离（外正内负）
 #  14  : 剩余攻击次数（ammo）
 #  15  : 水平速度标量（优先 vel.direct；否则 sqrt(vx^2+vy^2)）
-#  16  ：100000, 最近导弹距离 大约是雷达探测距离
-#  17  ： 最近导弹运动方向
-#  18  ：以红方无人机为视角到最近导弹的方向
+#
 # act4:
 #  0-2 : (rate, direct, vz) —— 最近1秒内下发的 vel 命令；没有则用实测兜底
 #  3   : 攻击标志（上一秒窗口内是否确认过一次“执行打击成功”）
@@ -38,6 +36,14 @@ import rflysim
 from rflysim import RflysimEnvConfig, Position
 from rflysim.client import VehicleClient
 from BlueForce import CombatSystem
+import math
+
+# ======= BC 策略加载器（适配 64→16，多机共享一份输入/输出）=======
+import json as _json
+import numpy as _np
+import torch as _torch
+from torch import nn as _nn
+
 
 # ==================== 你的原始常量（可按需调整） ====================
 DESTROYED_FLAG = "DAMAGE_STATE_DESTROYED"
@@ -52,21 +58,9 @@ DESTROY_CODES = {1}
 
 vel_0 = rflysim.Vel()
 vel_0.vz = 150
+vel_0.rate = 200
+vel_0.direct = 90
 
-# vel_0.rate = 200
-# vel_0.direct = 90
-
-# ====== 新增：开局定速向东 + 定时提速配置 ======
-FULL_SPEED = 200           # 全速
-EAST_HEADING_DEG = 90      # 向东
-BOOST_AFTER_SEC = 120.0     # 多少仿真秒后把另外三架提到全速
-# 初始速度（除 10085 外三架一开始较慢）
-INITIAL_SPEEDS = {
-  10085: 200,  # 指定：10085 开局即全速
-  10091: 80,
-  10084: 100,
-  10086: 80,
-}
 BOUNDARY_RECT = {
     "min_x": 101.07326442811694,
     "max_x": 103.08242360888715,
@@ -77,7 +71,6 @@ JAM_CENTER = (101.96786384206956, 40.2325)
 JAM_EDGE_PT = (101.84516211958464, 40.2325)
 JAM_RADIUS_M = None
 BLUE_DIST_CAP = 70000.0
-
 
 # ==================== 通用工具函数 ====================
 def _bearing_deg_from_A_to_B(lonA, latA, lonB, latB):
@@ -288,6 +281,188 @@ def normalize_visible(visible):
                 tracks.append(item)
         out[int(detector_id)] = tracks
     return out
+class _BC_MLP(_nn.Module):
+    def __init__(self, in_dim, cont_dim, bin_dim, hidden=(256,256), dropout=0.0):
+        super().__init__()
+        layers=[]; last=in_dim
+        for h in hidden:
+            layers += [_nn.Linear(last, h), _nn.ReLU()]
+            if dropout>0: layers += [_nn.Dropout(dropout)]
+            last=h
+        self.shared = _nn.Sequential(*layers) if layers else _nn.Identity()
+        self.cont_head = _nn.Linear(last, cont_dim) if cont_dim>0 else None
+        self.bin_head  = _nn.Linear(last, bin_dim)  if bin_dim>0 else None
+    def forward(self, x):
+        z = self.shared(x); out={}
+        if self.cont_head is not None: out["cont"] = self.cont_head(z)
+        if self.bin_head  is not None: out["bin_logits"] = self.bin_head(z)
+        return out
+
+class BCPredictor64x16:
+    """
+    和 bc_train.py 产物兼容（meta.json + policy.pt）
+    - 输入：按 meta['obs_cols'] 排序的一整帧 obs64（4架红机×obs16，顺序需与训练一致：sorted(self.red_ids)）
+    - 输出：按 meta['act_cols'] 排序的 act16（4架红机×act4），随后再按每架红机切片
+    """
+    def __init__(self, out_dir: str):
+        meta = _json.load(open(os.path.join(out_dir, "meta.json"), "r", encoding="utf-8"))
+        self.obs_cols   = meta["obs_cols"]
+        self.act_cols   = meta["act_cols"]
+        self.cont_cols  = meta["cont_cols"]
+        self.binary_cols= meta["binary_cols"]
+        m = meta["model"]
+        self.model = _BC_MLP(m["in_dim"], m["cont_dim"], m["bin_dim"],
+                             hidden=tuple(m.get("hidden",[256,256])), dropout=m.get("dropout",0.0))
+        self.model.load_state_dict(_torch.load(os.path.join(out_dir, "policy.pt"), map_location="cpu"))
+        self.model.eval()
+
+        # 归一化
+        self.obs_mean = _np.array([meta["obs_mean"][c] for c in self.obs_cols], dtype=_np.float32)
+        self.obs_std  = _np.array([meta["obs_std"][c]  for c in self.obs_cols], dtype=_np.float32)
+        if self.cont_cols:
+            self.cont_mean = _np.array([meta["cont_mean"][c] for c in self.cont_cols], dtype=_np.float32)
+            self.cont_std  = _np.array([meta["cont_std"][c]  for c in self.cont_cols], dtype=_np.float32)
+        else:
+            self.cont_mean = None; self.cont_std = None
+
+        # 建立列到索引的映射，便于重排
+        self._obs_idx = {c:i for i,c in enumerate(self.obs_cols)}
+        self._act_idx = {c:i for i,c in enumerate(self.act_cols)}
+        self._cont_idx= {c:i for i,c in enumerate(self.cont_cols)} if self.cont_cols else {}
+        self._bin_idx = {c:i for i,c in enumerate(self.binary_cols)} if self.binary_cols else {}
+
+    def predict_full(self, obs_dict: dict) -> _np.ndarray:
+        """
+        obs_dict: { 'obs_0':..., 'obs_1':..., ..., 与 meta.obs_cols 完全对齐 }
+        返回 act 向量（反归一化后的连续 + 二值阈值化），顺序与 meta.act_cols 一致，dtype=float，二值为0/1
+        """
+        # 排列 & 归一化
+        x = _np.array([float(obs_dict[c]) for c in self.obs_cols], dtype=_np.float32)
+        x = (x - self.obs_mean) / self.obs_std
+        with _torch.no_grad():
+            out = self.model(_torch.from_numpy(x).unsqueeze(0))
+        result = _np.zeros((len(self.act_cols),), dtype=_np.float32)
+
+        # 连续头
+        if self.cont_cols:
+            cont_norm = out["cont"].cpu().numpy()[0]
+            cont = cont_norm * self.cont_std + self.cont_mean
+            for c, i in self._cont_idx.items():
+                result[self._act_idx[c]] = cont[i]
+        # 二值头
+        if self.binary_cols:
+            logits = out["bin_logits"].cpu().numpy()[0]
+            probs = 1.0 / (1.0 + _np.exp(-logits))
+            for c, i in self._bin_idx.items():
+                result[self._act_idx[c]] = 1.0 if probs[i] >= 0.5 else 0.0
+        return result
+
+# ======= Runtime: stateful seq predictor (GRU/LSTM), 读取 seq_meta.json/seq_policy.pt =======
+import math
+
+class _RNNRuntime(_nn.Module):
+    def __init__(self, in_dim, cont_dim, bin_dim, rnn_type, hidden_size, num_layers, dropout):
+        super().__init__()
+        rnn_cls = {"gru": _nn.GRU, "lstm": _nn.LSTM}[rnn_type]
+        self.rnn_type = rnn_type
+        self.rnn = rnn_cls(
+            in_dim, hidden_size, num_layers=num_layers, batch_first=True,
+            dropout=dropout if num_layers > 1 else 0.0
+        )
+        # 头部命名统一用 head_c / head_b（与 forward 对应）
+        self.head_c = _nn.Linear(hidden_size, cont_dim) if cont_dim > 0 else None
+        self.head_b = _nn.Linear(hidden_size, bin_dim) if bin_dim > 0 else None
+
+    def forward(self, x, h=None):
+        z, h = self.rnn(x, h)  # x: [B,T,D]；在线推理时 B=T=1
+        out = {}
+        if self.head_c is not None:
+            out["cont"] = self.head_c(z)  # [B,T,Cc]
+        if self.head_b is not None:
+            out["bin_logits"] = self.head_b(z)  # [B,T,Cb]
+        return out, h
+class BCSeqPredictor64x16:
+    """
+    - 读入 ./bc_out_seq/seq_meta.json + seq_policy.pt
+    - 每次 step(obs,t) 会使用 RNN 隐状态连续推理（记住上一秒）
+    - 需要 episode 开始时 reset_episode(t0=?)
+    """
+    def __init__(self, out_dir: str, device: str = "cpu"):
+        meta_path = os.path.join(out_dir, "seq_meta.json")
+        pol_path  = os.path.join(out_dir, "seq_policy.pt")
+        if not os.path.exists(meta_path):
+            raise FileNotFoundError(f"seq_meta.json not found in {out_dir}")
+        meta = _json.load(open(meta_path, "r", encoding="utf-8"))
+        m = meta["model"]
+        self.obs_cols  = meta["obs_cols"]
+        self.act_cols  = meta["act_cols"]
+        self.cont_cols = meta["cont_cols"]
+        self.bin_cols  = meta["binary_cols"]
+        self.obs_mean = _np.array([meta["obs_mean"][c] for c in self.obs_cols], dtype=_np.float32)
+        self.obs_std  = _np.array([meta["obs_std"][c]  for c in self.obs_cols], dtype=_np.float32)
+        self.cont_mean = _np.array([meta["cont_mean"].get(c,0) for c in self.cont_cols], dtype=_np.float32) if self.cont_cols else None
+        self.cont_std  = _np.array([meta["cont_std"].get(c,1)  for c in self.cont_cols], dtype=_np.float32) if self.cont_cols else None
+        self.time_feat_dim = int(meta["time_feat"]["dim"])
+        self.model = _RNNRuntime(
+            in_dim=m["in_dim"], cont_dim=m["cont_dim"], bin_dim=m["bin_dim"],
+            rnn_type=m["rnn_type"], hidden_size=m["hidden_size"],
+            num_layers=m["num_layers"], dropout=m["dropout"]
+        )
+        state = _torch.load(pol_path, map_location=device)
+        # 将训练时的 head_cont/head_bin 重命名为运行时的 head_c/head_b
+        new_state = {}
+        for k, v in state.items():
+            if k.startswith("head_cont."):
+                new_state[k.replace("head_cont.", "head_c.")] = v
+            elif k.startswith("head_bin."):
+                new_state[k.replace("head_bin.", "head_b.")] = v
+            else:
+                new_state[k] = v
+        self.model.load_state_dict(new_state, strict=True)
+
+        self.model.eval()
+        self.device = _torch.device(device)
+        self.h = None
+        self.t0 = None
+        self.tspan = 300.0  # 在线未知总时长时，给个平滑的时间尺度
+
+    def reset_episode(self, t0: float = 0.0, tspan_hint: float = None):
+        self.h = None
+        self.t0 = float(t0)
+        if tspan_hint and tspan_hint > 0:
+            self.tspan = float(tspan_hint)
+
+    def _time_feat(self, t: float):
+        if self.t0 is None:
+            self.t0 = float(t)
+        t_norm = float(t - self.t0) / max(1.0, self.tspan)
+        feats = [t_norm, math.sin(2*math.pi*t_norm), math.cos(2*math.pi*t_norm)]
+        return _np.array(feats[:self.time_feat_dim], dtype=_np.float32)
+
+    def step(self, obs_dict: dict, t: float):
+        x = _np.array([float(obs_dict[c]) for c in self.obs_cols], dtype=_np.float32)
+        x = (x - self.obs_mean) / self.obs_std
+        tf = self._time_feat(t)
+        x = _np.concatenate([x, tf], axis=0)[None, None, :]  # [1,1,D]
+        with _torch.no_grad():
+            out, self.h = self.model(_torch.from_numpy(x).to(self.device), self.h)
+
+        result = _np.zeros((len(self.act_cols),), dtype=_np.float32)
+        if self.cont_cols:
+            cont = out["cont"].cpu().numpy()[0,0,:]
+            cont = cont * (self.cont_std if self.cont_std is not None else 1.0) + (self.cont_mean if self.cont_mean is not None else 0.0)
+            for i,c in enumerate(self.cont_cols):
+                idx = self.act_cols.index(c); result[idx] = float(cont[i])
+        if self.bin_cols:
+            logits = out["bin_logits"].cpu().numpy()[0,0,:]
+            probs = 1.0/(1.0+_np.exp(-logits))
+            for i,c in enumerate(self.bin_cols):
+                idx = self.act_cols.index(c); result[idx] = 1.0 if probs[i] >= 0.5 else 0.0
+        return result
+
+
+
+
 
 # ==================== 记录器 ====================
 class RLRecorder:
@@ -299,7 +474,7 @@ class RLRecorder:
         self.rows_for_csv = []
         self.latest_obs_vec = None
         self.latest_act_vec = None
-        self.has_dumped = False  # 只写一次
+        self.has_dumped = False
 
     def pack_single_obs19(
         self,
@@ -311,49 +486,32 @@ class RLRecorder:
         blue4_dists,
         nearest_blue_speed,
         nearest_blue_dir,
-        bearing_to_nearest_blue,   # ★ 新增：到最近蓝机的方位角（0-360°）
-        nearest_msl_dist,          # ★ 新增：最近导弹距离
-        nearest_msl_dir,           # ★ 新增：最近导弹的运动方向（优先 get_situ_info 的 target_direction）
-        bearing_to_nearest_msl,    # ★ 新增：到最近导弹的方位角（0-360°）
+        bearing_to_nearest_blue,   # 新增：红->最近蓝机方位角
+        nearest_msl_dist,          # 新增：最近导弹距离
+        nearest_msl_dir,           # 新增：最近导弹运动方向
+        bearing_to_nearest_msl,    # 新增：红->最近导弹方位角
         vel_meas=None
     ):
-        """
-        观测(19维) per 红机：
-          0-3   : 边界四距 (left, right, down, up)
-          4-6   : 实测速度 (vx, vy, vz) （vy=正东、vx=正北）
-          7-10  : 最近4个蓝机距离（不足补 BLUE_DIST_CAP）
-          11    : 最近蓝机速度（标量）
-          12    : 最近蓝机运动方向（0-360°，北=0 顺时针）
-          13    : 到最近蓝机的方位角（0-360°，从红机指向蓝机）
-          14    : 最近导弹距离
-          15    : 最近导弹运动方向（0-360°）
-          16    : 到最近导弹的方位角（0-360°）
-          17    : 到干扰区边界的有符号距离（外正内负）
-          18    : 剩余攻击次数（ammo）
-        备注：水平速度标量（原 obs16[15]）不再单独占位；如仍需，可在落盘 info 中记录。
-        """
         left, right, down, up = _dist_to_boundary_m(client, obs["pos"]["lon"], obs["pos"]["lat"])
         vx, vy, vz_meas = obs["vel"]["vx"], obs["vel"]["vy"], obs["vel"]["vz"]
         ammo = obs["ammo"]
 
         def nz(x, d=0.0):
-            try:
-                return float(x)
-            except Exception:
-                return d
+            try: return float(x)
+            except Exception: return d
 
         obs19 = [
-            nz(left), nz(right), nz(down), nz(up),
-            nz(vx), nz(vy), nz(vz_meas),
-            *[nz(d) for d in blue4_dists],
-            nz(nearest_blue_speed),
-            nz(nearest_blue_dir) % 360.0,
-            nz(bearing_to_nearest_blue) % 360.0,
-            nz(nearest_msl_dist),
-            nz(nearest_msl_dir) % 360.0 if nearest_msl_dir is not None else 0.0,
-            nz(bearing_to_nearest_msl) % 360.0 if bearing_to_nearest_msl is not None else 0.0,
-            nz(jam_signed_dist),
-            int(ammo) if ammo is not None else 0
+            nz(left), nz(right), nz(down), nz(up),             # 0-3
+            nz(vx), nz(vy), nz(vz_meas),                       # 4-6
+            *[nz(d) for d in blue4_dists],                     # 7-10
+            nz(nearest_blue_speed),                            # 11
+            nz(nearest_blue_dir) % 360.0,                      # 12
+            nz(bearing_to_nearest_blue) % 360.0,               # 13
+            nz(nearest_msl_dist),                              # 14
+            (nz(nearest_msl_dir) % 360.0) if nearest_msl_dir is not None else 0.0,    # 15
+            (nz(bearing_to_nearest_msl) % 360.0) if bearing_to_nearest_msl is not None else 0.0,  # 16
+            nz(jam_signed_dist),                               # 17
+            int(ammo) if ammo is not None else 0              # 18
         ]
         return obs19
 
@@ -362,11 +520,11 @@ class RLRecorder:
         act4:
           0: rate   (deg, 0=北, 顺时针)
           1: direct (水平速度大小)
-          2: vz
+          2: vz     (沿用旧逻辑: 优先命令缓存; 否则 pos_meas.z 作为“高度兜底”)
           3: 攻击标志
         说明:
           - 若最近1秒内我们下发过 vel 命令, 则优先用命令(rate, direct, vz)
-          - 否则从实测 vel_meas.vx/vy 反算 (rate, direct), vz 用 pos_meas.z 兜底
+          - 否则从实测 vel_meas.vx/vy 反算 (rate, direct), vz 仍按旧逻辑兜底
         """
         vcmd = self.last_vel_cmd.get(int(rid))
 
@@ -381,15 +539,20 @@ class RLRecorder:
                 return default
 
         if vcmd and (sim_sec - int(vcmd["t"])) <= 1:
+            # 最近 1 秒内有我们下发的命令 -> 直接用命令数值
             rate_cmd = nz(vcmd.get("rate"), 0.0)
             direct_cmd = nz(vcmd.get("direct"), 0.0)
             vz_cmd = nz(vcmd.get("vz"), nz(getattr(pos_meas, "z", None), 0.0))
             return [rate_cmd % 360.0, direct_cmd, vz_cmd, int(attack_flag)]
 
+        # 否则用实测 vx, vy 反算 rate/direct
         vx = getattr(vel_meas, "vx", None) if vel_meas else None
         vy = getattr(vel_meas, "vy", None) if vel_meas else None
         direct_calc, rate_calc = _direct_rate_from_vx_vy(vx, vy)
+
+        # vz 仍按旧逻辑兜底（和你原来的数据对齐：没有命令就拿 pos_meas.z）
         vz_fallback = nz(getattr(pos_meas, "z", None), 0.0)
+
         return [rate_calc, direct_calc, vz_fallback, int(attack_flag)]
 
     def add_vector_row(self, sim_sec, obs_vec, act_vec):
@@ -415,13 +578,7 @@ class RLRecorder:
     def record_tick(self, sim_sec, red_id, obs_dict, extra_info=None):
         a = self.last_action.get(int(red_id))
         rec_action = (dict(a) | {"age_sec": int(sim_sec) - int(a.get("t", sim_sec))}) if a else None
-        self.buffer.append({
-            "t": int(sim_sec),
-            "red_id": int(red_id),
-            "obs": obs_dict,
-            "action": rec_action,
-            "info": (extra_info or {})
-        })
+        self.buffer.append({"t": int(sim_sec), "red_id": int(red_id), "obs": obs_dict, "action": rec_action, "info": (extra_info or {})})
 
     def dump_csv(self, path):
         if self.has_dumped:
@@ -430,7 +587,7 @@ class RLRecorder:
             print("[RL] No vector data to dump:", path, flush=True)
             self.has_dumped = True
             return
-        n_act = 16  # 4机 × 4维
+        n_act = 16
         n_obs = len(self.rows_for_csv[0]) - 1 - n_act
         header = ["t"] + [f"obs_{i}" for i in range(n_obs)] + [f"act_{j}" for j in range(n_act)]
         abspath = os.path.abspath(path)
@@ -441,7 +598,6 @@ class RLRecorder:
             w.writerows(self.rows_for_csv)
         print(f"[RL] Dumped {len(self.rows_for_csv)} rows to {abspath}", flush=True)
         self.has_dumped = True
-
 
 # ==================== 红方控制器（缩略自你上一版，逻辑一致） ====================
 class RedForceController:
@@ -473,11 +629,11 @@ class RedForceController:
         self._last_approach_flag = {}           # rid -> 上次是否判定为“接近”
 
         # --- 躲避导弹相关常量 ---
-        self.MISSILE_THREAT_DIST_M = 75000.0      # 威胁距离阈值
+        self.MISSILE_THREAT_DIST_M = 50000.0      # 威胁距离阈值
         self.MISSILE_BEARING_THRESH_DEG = 25.0   # 视线角阈值：导弹航向与“导弹->红机连线”夹角小于该值视为“冲向我”
-        self.EVASIVE_TURN_DEG = 30.0             # 机动：相对导弹方向 90°
+        self.EVASIVE_TURN_DEG = 90.0             # 机动：相对导弹方向 90°
         self.EVASIVE_SPEED_MIN = 220.0           # 躲避时最低水平速度（m/s），会与当前速度取 max
-        self.EVASIVE_DURATION_SEC = 30.0          # 每次躲避持续时长（限制攻击）
+        self.EVASIVE_DURATION_SEC = 10.0          # 每次躲避持续时长（限制攻击）
         self.EVASIVE_COOLDOWN_SEC = 5.0          # 躲避冷却：避免频繁反复机动
 
         # --- 躲避导弹状态 ---
@@ -487,12 +643,20 @@ class RedForceController:
         self._evasive_until = {}                 # rid -> 时间戳（在此之前禁止开火）
         self._last_evasive_time = {}             # rid -> 最近一次触发躲避的时间戳
 
-        self._init_speed_done = False
-        self._boost_done = {rid: False for rid in self.red_ids}
-
         # --- 全灭后延迟结束（20s） ---
         self._end_grace_until = None   # None 或 墙钟时间戳（time.time()）
         self._end_reason = ""
+        # ======= BC 策略接入 =======
+        self._bc: Optional[BCPredictor64x16] = None
+        self._bc_out_dir: Optional[str] = None
+        self._policy_attack_intent = {}   # rid -> 0/1  （本秒意图，由策略决定）
+        self._last_policy_sec = -1        # 记录已执行策略的 sim_sec，确保“每秒只下达一次”
+        # ======= BC 策略接入 =======
+        self._bc: Optional[BCPredictor64x16] = None
+        self._bc_seq: Optional[BCSeqPredictor64x16] = None   # <— 新增
+        self._bc_mode = "none"                                # <— 新增: "seq" | "mlp" | "none"
+        self._bc_out_dir: Optional[str] = None
+
 
         for rid in red_ids:
             try:
@@ -500,31 +664,71 @@ class RedForceController:
                 print(f"[Red] Radar ON for {rid}, uid={uid}", flush=True)
             except Exception as e:
                 print(f"[Red] enable_radar({rid}) failed: {e}", flush=True)
-
-        # 开局定速向东（10085 全速，其他 100/100/80）
-        try:
-            t0 = self.client.get_sim_time()
-        except Exception:
-            t0 = 0.0
-
-        for rid in sorted(self.red_ids):
-            spd = float(INITIAL_SPEEDS.get(int(rid), 100.0))
-            vcmd = rflysim.Vel()
-            # 你的环境：vcmd.rate = 水平速度标量；vcmd.direct = 航向角(0=北, 顺时针)
-            vcmd.rate = spd
-            vcmd.direct = EAST_HEADING_DEG
-            vcmd.vz = vel_0.vz
             try:
-                uid = self.client.set_vehicle_vel(int(rid), vcmd)
-                # 记录“最近一次命令”，便于 act4 回填
-                self.recorder.mark_vel_cmd(int(rid), rate=vcmd.rate, direct=vcmd.direct, vz=vcmd.vz, sim_time=t0)
-                print(f"[INIT-SPEED] rid={rid} -> speed={vcmd.rate} heading={vcmd.direct}° vz={vcmd.vz}", flush=True)
+                vuid = self.client.set_vehicle_vel(rid, vel_0)
+                print(f"[Red] vel set for {rid}, uid={vuid}", flush=True)
+                time.sleep(0.2)
+                print(client.get_command_status(vuid))
             except Exception as e:
-                print(f"[INIT-SPEED] set_vehicle_vel({rid}) failed: {e}", flush=True)
-
-        self._init_speed_done = True
+                print(f"[Red] set_vehicle_vel({rid}) failed: {e}", flush=True)
 
     # ---- 内部工具 ----
+    # ---- 内部工具 ----
+    def _resolve_latest_seq_dir(self, root):
+        import os, glob
+        # 支持直接就是落在根目录，或在时间戳子目录
+        candidates = []
+        # 1) 根目录
+        if os.path.exists(os.path.join(root, "seq_meta.json")) and os.path.exists(os.path.join(root, "seq_policy.pt")):
+            candidates.append(root)
+        # 2) 子目录
+        for d in sorted(glob.glob(os.path.join(root, "*")), reverse=True):
+            if os.path.isdir(d) and \
+                    os.path.exists(os.path.join(d, "seq_meta.json")) and \
+                    os.path.exists(os.path.join(d, "seq_policy.pt")):
+                candidates.append(d)
+        return candidates[0] if candidates else None
+
+    def attach_bc_policy(self, bc_out_dir: str):
+        import os, traceback
+        self._bc_out_dir = bc_out_dir
+        self._bc = None
+        self._bc_seq = None
+        self._bc_mode = "none"
+
+        try:
+            print(f"[BC] Try load from: {bc_out_dir}", flush=True)
+
+            # —— 先找序列策略（优先级高）——
+            real_seq_dir = self._resolve_latest_seq_dir(bc_out_dir)
+            if real_seq_dir is not None:
+                print(f"[BC] Found sequence policy under: {real_seq_dir}", flush=True)
+                # 直接使用你上面定义的推理器
+                self._bc_seq = BCSeqPredictor64x16(real_seq_dir, device="cpu")
+                self._bc_mode = "seq"
+                print(f"[BC] Loaded SEQ policy ok: {real_seq_dir}", flush=True)
+                return
+
+            # —— 再尝试 MLP（如果你也会导出 meta.json/policy.pt）——
+            if os.path.exists(os.path.join(bc_out_dir, "meta.json")):
+                print("[BC] Found MLP meta (meta.json). Loading MLP policy...", flush=True)
+                self._bc = BCPredictor64x16(bc_out_dir)
+                self._bc_mode = "mlp"
+                print(f"[BC] Loaded MLP policy ok from {bc_out_dir}", flush=True)
+                return
+
+            print(
+                f"[BC-WARN] No seq_meta.json or meta.json under {bc_out_dir} (or its subfolders). Fall back to baseline.",
+                flush=True)
+
+        except Exception as e:
+            print(f"[BC] load failed: {e}", flush=True)
+            traceback.print_exc()
+            print("[BC-WARN] 策略加载失败！红方将退回默认逻辑（就近分配/冷却/弹药/躲避），不参考策略输出。", flush=True)
+            self._bc = None
+            self._bc_seq = None
+            self._bc_mode = "none"
+
     def _estimate_msl_heading_speed(self, mid, lon_now, lat_now, t_now):
         """
         基于上一次缓存位置，估计导弹航向(度，0北顺时针) 与 地速(m/s)。
@@ -593,7 +797,7 @@ class RedForceController:
                     return t.get("lon"), t.get("lat")
         return (None, None)
 
-    def _fetch_score_with_retry(self, tries=1, wait=0.2, where="(unknown)"):
+    def _fetch_score_with_retry(self, tries=20, wait=0.2, where="(unknown)"):
         score_obj = None
         for _ in range(tries):
             try:
@@ -618,7 +822,7 @@ class RedForceController:
             self.client.stop()
         except Exception as e:
             print("[AutoStop] client.stop() failed:", e, flush=True)
-        self._fetch_score_with_retry(tries=1, wait=0.2, where="post-stop")
+        self._fetch_score_with_retry(tries=20, wait=0.2, where="post-stop")
         try:
             self.recorder.dump_csv(self.out_csv_path)
         except Exception as e:
@@ -674,6 +878,7 @@ class RedForceController:
                 self._end_reason = "All 4 BLUE aircraft destroyed."
             else:
                 self._end_reason = "All 4 RED aircraft destroyed."
+            #延迟结束的时间设置
             self._end_grace_until = now_wall + 1.0
             print(f"[Grace] {self._end_reason} Ending in 20s...", flush=True)
             return  # 本次先不结束，等下次再检查是否到时
@@ -706,41 +911,6 @@ class RedForceController:
         self._update_destroyed_from_situ()
         sim_t = self.client.get_sim_time()
         sim_sec = int(sim_t)
-
-        # 到点把非 10085 的三架提到全速（保持向东）
-        if self._init_speed_done and (sim_t >= BOOST_AFTER_SEC):
-            try:
-                for rid in sorted(self.red_ids):
-                    if int(rid) == 10085:
-                        self._boost_done[rid] = True  # 10085 一开始就是全速
-                        continue
-                    if self._boost_done.get(rid, False):
-                        continue
-
-                    vcmd = rflysim.Vel()
-                    vcmd.rate = float(FULL_SPEED)
-                    vcmd.direct = EAST_HEADING_DEG
-                    # vz 保持当前测到的垂直速度（也可改成固定 vel_0.vz）
-                    try:
-                        v_meas = self.client.get_vehicle_vel().get(int(rid))
-                        vcmd.vz = getattr(v_meas, "vz", vel_0.vz)
-                    except Exception:
-                        vcmd.vz = vel_0.vz
-
-                    try:
-                        uid = self.client.set_vehicle_vel(int(rid), vcmd)
-                        self.recorder.mark_vel_cmd(int(rid), rate=vcmd.rate, direct=vcmd.direct, vz=vcmd.vz,
-                                                   sim_time=sim_t)
-                        self._boost_done[rid] = True
-                        print(
-                            f"[BOOST] t={sim_t:.1f}s rid={rid} -> speed={vcmd.rate} heading={vcmd.direct}° vz={vcmd.vz}",
-                            flush=True)
-                    except Exception as e:
-                        print(f"[BOOST] set_vehicle_vel({rid}) failed: {e}", flush=True)
-            except Exception as e:
-                print("[BOOST] block failed:", e, flush=True)
-
-
         self._score_counter = getattr(self, "_score_counter", 0) + 1
         if self._score_counter % 5 == 0:
             try:
@@ -748,15 +918,13 @@ class RedForceController:
             except Exception:
                 self._score_cache = None
 
-        # —— 每秒打点观测/动作向量 —— #
         if sim_sec != getattr(self, "_last_logged_sec", -1):
-            # 预取 situ（用于导弹方向）
+            # —— 预取 situ（用于导弹方向）；并构建导弹方向、位置表 —— #
             try:
                 situ_raw_full = self.client.get_situ_info() or {}
             except Exception:
                 situ_raw_full = {}
 
-            # 建立导弹方向表（mid -> target_direction）
             missile_dir_map = {}
             for vid, info in (situ_raw_full or {}).items():
                 try:
@@ -765,7 +933,6 @@ class RedForceController:
                     continue
                 if _id is None or _id >= 10000:
                     continue
-                # 方向字段兼容多名字
                 if isinstance(info, dict):
                     d = info.get("target_direction") or info.get("direction") or info.get("dir")
                 else:
@@ -778,8 +945,8 @@ class RedForceController:
                     except Exception:
                         pass
 
-            # 收集可能的导弹坐标（优先 all_pos；其次可见表）
-            missiles_pos = {}  # mid -> (lon, lat)
+            # 收集导弹位置（优先 all_pos；其次可见表）
+            missiles_pos = {}
             for vid, p in (all_pos or {}).items():
                 try:
                     _id = int(vid)
@@ -790,14 +957,12 @@ class RedForceController:
             for tracks in (vis or {}).values():
                 for t in (tracks or []):
                     tid = t.get("target_id")
-                    if tid is None or int(tid) >= 10000:
-                        continue
-                    if tid not in missiles_pos:
+                    if tid is not None and int(tid) < 10000 and tid not in missiles_pos:
                         lonB, latB = t.get("lon"), t.get("lat")
                         if lonB is not None and latB is not None:
                             missiles_pos[int(tid)] = (float(lonB), float(latB))
 
-            obs_concat = [];
+            obs_concat = []
             act_concat = []
 
             for rid in sorted(self.red_ids):
@@ -806,7 +971,7 @@ class RedForceController:
                 my_lat = getattr(my_p, "y", None) if my_p else None
                 tracks = vis.get(rid, []) or []
 
-                # --- 最近4个蓝机距离 ---
+                # 最近4个蓝机距离
                 dlist = []
                 for t in tracks:
                     tid = t.get("target_id")
@@ -816,9 +981,8 @@ class RedForceController:
                     if None in (lonB, latB, my_lon, my_lat):
                         continue
                     try:
-                        d = self.client.get_distance_by_lon_lat(
-                            Position(x=my_lon, y=my_lat, z=0), Position(x=lonB, y=latB, z=0)
-                        )
+                        d = self.client.get_distance_by_lon_lat(Position(x=my_lon, y=my_lat, z=0),
+                                                                Position(x=lonB, y=latB, z=0))
                     except Exception:
                         d = _geo_dist_haversine_m(my_lon, my_lat, lonB, latB)
                     if d is not None:
@@ -829,21 +993,20 @@ class RedForceController:
                 else:
                     dlist = dlist[:4]
 
-                # --- 最近蓝机（速度、运动方向 + ★到最近蓝机的方位角） ---
+                # 最近蓝机：速度、方向、红->蓝方位角
                 nb_speed, nb_dir, bearing_red_to_blue = None, None, None
                 if tracks and my_lon is not None and my_lat is not None:
                     best, best_t = None, None
                     for t in tracks:
                         tid = t.get("target_id")
-                        if tid is None or int(tid) < 10000:
+                        if tid is None or int(tid) < 10000:  # 只看蓝机
                             continue
                         lonB, latB = t.get("lon"), t.get("lat")
                         if lonB is None or latB is None:
                             continue
                         try:
-                            dd = self.client.get_distance_by_lon_lat(
-                                Position(x=my_lon, y=my_lat, z=0), Position(x=lonB, y=latB, z=0)
-                            )
+                            dd = self.client.get_distance_by_lon_lat(Position(x=my_lon, y=my_lat, z=0),
+                                                                     Position(x=lonB, y=latB, z=0))
                         except Exception:
                             dd = _geo_dist_haversine_m(my_lon, my_lat, lonB, latB)
                         if dd is not None and (best is None or dd < best):
@@ -852,35 +1015,34 @@ class RedForceController:
                         nb_speed = best_t.get("speed")
                         nb_dir = best_t.get("direction")
                         lonB, latB = best_t.get("lon"), best_t.get("lat")
-                        if lonB is not None and latB is not None and my_lon is not None and my_lat is not None:
+                        if lonB is not None and latB is not None:
                             bearing_red_to_blue = _bearing_deg_from_A_to_B(my_lon, my_lat, lonB, latB)
-                        # 若蓝机自身方向缺失，用位置方位角兜底（与旧逻辑一致）
+                        # 若蓝机自身方向缺失，用位置方位角兜底
                         if nb_dir is None and lonB is not None and latB is not None:
                             nb_dir = _bearing_deg_from_A_to_B(my_lon, my_lat, lonB, latB)
 
-                # --- 最近导弹 3 项（距离、导弹运动方向、到导弹的方位角） ---
+                # 最近导弹三项：距离、导弹方向（优先 situ），红->导弹方位角
                 nearest_msl_dist, nearest_msl_dir, bearing_red_to_msl = None, None, None
                 if my_lon is not None and my_lat is not None and missiles_pos:
                     best_mid, best_d, best_pos = None, None, None
                     for mid, (mlon, mlat) in missiles_pos.items():
                         dd = _geo_dist_haversine_m(my_lon, my_lat, mlon, mlat)
-                        if dd is None:
-                            continue
+                        if dd is None: continue
                         if best_d is None or dd < best_d:
                             best_mid, best_d, best_pos = mid, float(dd), (mlon, mlat)
                     if best_mid is not None:
                         nearest_msl_dist = best_d
                         bearing_red_to_msl = _bearing_deg_from_A_to_B(my_lon, my_lat, best_pos[0], best_pos[1])
-                        # 运动方向：优先 situ 的 target_direction；若无，则用上一帧推算（_missile_prev_xy_t）
                         if best_mid in missile_dir_map:
                             nearest_msl_dir = missile_dir_map[best_mid]
                         else:
+                            # 无 situ 方向时，用上一帧导弹位姿推算
                             prev = getattr(self, "_missile_prev_xy_t", {}).get(best_mid)
                             if prev and None not in prev[:2]:
                                 prev_lon, prev_lat, _prev_t = prev
                                 nearest_msl_dir = _bearing_deg_from_A_to_B(prev_lon, prev_lat, best_pos[0], best_pos[1])
 
-                # --- 其余通用量 ---
+                # 其余量
                 jam_signed = _signed_dist_to_jam_boundary_m(self.client, my_lon, my_lat)
                 vel_meas = vel_all.get(rid)
                 obs_raw = {
@@ -904,34 +1066,66 @@ class RedForceController:
                 act4 = self.recorder.pack_single_act4(rid, sim_sec, vel_meas=vel_meas, pos_meas=my_p)
                 act_concat.extend(act4)
 
-                # ===== 结构化记录（便于回放/调试，对应字段也改了）=====
-                # 水平速度标量（如需要保留）：
-                try:
-                    from math import sqrt
-                    speed_scalar = sqrt(
-                        float(obs_raw["vel"]["vx"] or 0.0) ** 2 + float(obs_raw["vel"]["vy"] or 0.0) ** 2)
-                except Exception:
-                    speed_scalar = None
-
+                # 结构化记录（索引与 19 维对齐）
                 self.recorder.record_tick(sim_sec, rid, {
                     "boundary_dists": {"left": obs19[0], "right": obs19[1], "down": obs19[2], "up": obs19[3]},
                     "vel": {"vx": obs19[4], "vy": obs19[5], "vz": obs19[6]},
                     "blue_dists": dlist,
                     "nearest_blue_speed": nb_speed,
                     "nearest_blue_dir": nb_dir,
-                    "bearing_to_nearest_blue": bearing_red_to_blue,
-                    "nearest_missile_dist": nearest_msl_dist,
-                    "nearest_missile_dir": nearest_msl_dir,
-                    "bearing_to_nearest_missile": bearing_red_to_msl,
+                    "bearing_to_nearest_blue": obs19[13],
+                    "nearest_missile_dist": obs19[14],
+                    "nearest_missile_dir": obs19[15],
+                    "bearing_to_nearest_missile": obs19[16],
                     "jam_signed_dist": obs19[17],
                     "ammo": obs19[18],
-                    "speed_scalar": speed_scalar,  # 保留在 info，方便兼容旧分析代码
                 })
 
             self.recorder.latest_obs_vec = obs_concat
             self.recorder.latest_act_vec = act_concat
             self.recorder.add_vector_row(sim_sec, obs_concat, act_concat)
             self._last_logged_sec = sim_sec
+
+        # ——【在每秒观测拼接完之后】执行一次策略，产出 4×act4 ——
+        try:
+            if sim_sec != self._last_policy_sec and self.recorder.latest_obs_vec is not None:
+                full_obs = {f"obs_{i}": float(self.recorder.latest_obs_vec[i]) for i in
+                            range(len(self.recorder.latest_obs_vec))}
+                if self._bc_mode == "seq" and self._bc_seq is not None:
+                    act_full = self._bc_seq.step(full_obs, t=sim_sec)  # <— 有记忆
+                elif self._bc_mode == "mlp" and self._bc is not None:
+                    act_full = self._bc.predict_full(full_obs)  # <— 旧版
+                else:
+                    act_full = None
+
+                if act_full is None:
+                    # 没有策略输出 -> 清零当秒意图，继续执行后面的基线开火逻辑
+                    for rid in self.red_ids:
+                        self._policy_attack_intent[rid] = 0
+                else:
+                    # 只有在有策略输出时，才切片并下发速度/攻击意图
+                    red_list = sorted(self.red_ids)
+                    for idx, rid in enumerate(red_list):
+                        a0, a1, a2, a3 = [float(act_full[idx * 4 + k]) for k in range(4)]
+                        vcmd = rflysim.Vel()
+                        vcmd.rate = max(0.0, float(a1))  # direct=速度大小 -> 接口的 rate
+                        vcmd.direct = float(a0) % 360.0  # rate=航向角   -> 接口的 direct
+                        vcmd.vz = float(a2)
+                        now_sim = self.client.get_sim_time()
+                        if self._evasive_until.get(rid, 0.0) > now_sim:
+                            self._policy_attack_intent[rid] = 0
+                            continue
+                        try:
+                            uid = self.client.set_vehicle_vel(rid, vcmd)
+                            self.recorder.mark_vel_cmd(rid, rate=vcmd.rate, direct=vcmd.direct, vz=vcmd.vz,
+                                                       sim_time=now_sim)
+                        except Exception as e:
+                            print(f"[BC] set_vehicle_vel({rid}) failed: {e}", flush=True)
+                        self._policy_attack_intent[rid] = 1 if int(a3) == 1 else 0
+                self._last_policy_sec = sim_sec
+
+        except Exception as e:
+            print("[BC] policy step failed:", e, flush=True)
 
         if self._ended:
             return
@@ -1286,6 +1480,67 @@ class RedForceController:
         if not assignments:
             return
 
+        # ===== 策略优先的攻击（本秒有意图的红机先试一次）=====
+        try:
+            now_sim2 = self.client.get_sim_time()
+            red_list = sorted(self.red_ids)
+            # 收集当前可攻击目标（未锁定、未摧毁）
+            candidate_tids = list(visible_blue_targets)
+
+            for rid in red_list:
+                if self._bc_mode in ("seq", "mlp") and (not self._policy_attack_intent.get(rid, 0)):
+                    continue
+                # 躲避窗口 & 冷却 & 弹药检查
+                if self._evasive_until.get(rid, 0.0) > now_sim2:
+                    continue
+                if (now_sim2 - self.last_fire_time.get(rid, 0.0)) < ATTACK_COOLDOWN_SEC:
+                    continue
+                if self.ammo.get(rid, 0) <= 0:
+                    continue
+
+                # 为该红机挑最近的可攻击蓝机
+                mypos = all_pos2.get(rid)
+                if mypos is None:
+                    continue
+                best_tid, best_d = None, 1e18
+                for tid in candidate_tids:
+                    if tid in self.destroyed_targets or tid in self.target_locks:
+                        continue
+                    t_lon, t_lat = self._get_target_pos(tid, vis2, all_pos2)
+                    if t_lon is None or t_lat is None:
+                        continue
+                    d = self._distance_m(mypos.x, mypos.y, t_lon, t_lat)
+                    if d < best_d:
+                        best_d, best_tid = d, tid
+
+                if best_tid is None:
+                    continue
+
+                # 真正发射（完全沿用你已有的流程，必须确认成功才记一次）
+                try:
+                    uid = self._fire_with_log(rid, best_tid)
+                    print(f"[BC-FIRE] {rid} -> {best_tid}, uid={uid}", flush=True)
+                    ok = self._is_fire_success(uid, max_tries=5, wait_s=0.1)
+                    if not ok:
+                        print(f"[Red] fire NOT confirmed for {rid}->{best_tid}, keep target available.", flush=True)
+                        time.sleep(0.1)
+                        continue
+
+                    # 记录发射成功（与你现有的一致）
+                    self.recorder.mark_attack_success(rid, self.client.get_sim_time())
+                    self.ammo[rid] -= 1
+                    self.last_fire_time[rid] = self.client.get_sim_time()
+                    self.assigned_target[rid] = best_tid
+                    self.target_locks[best_tid] = {"red_id": rid, "until": self.client.get_sim_time() + LOCK_SEC}
+                    # 从候选集中去掉这个目标（避免本轮重复）
+                    if best_tid in candidate_tids:
+                        candidate_tids.remove(best_tid)
+                    time.sleep(0.1)
+                except Exception as e:
+                    print(f"[BC-FIRE] set_target({rid},{best_tid}) failed: {e}", flush=True)
+        except Exception as e:
+            print("[BC-FIRE] block failed:", e, flush=True)
+
         for rid, tid in assignments:
             if tid in self.destroyed_targets:
                 continue
@@ -1412,6 +1667,12 @@ def run_one_episode(client, plan_id, out_csv_path, max_wall_time_sec=360, min_wa
 
     # === 启动红军控制线程 ===
     red_ctrl = RedForceController(client, RED_IDS, out_csv_path)
+    # 1) 改这里的路径为你的序列模型目录（bc_train_seq.py 的 --out_dir）
+    red_ctrl.attach_bc_policy("./bc_out_seq")     # 若该目录没有 seq_meta.json，会自动回退到 MLP
+    # 2) 保险起见，再重置一次序列隐藏态（如果加载的是序列策略）
+    if getattr(red_ctrl, "_bc_mode", "none") == "seq" and red_ctrl._bc_seq is not None:
+        red_ctrl._bc_seq.reset_episode(t0=0.0)
+
     red_thread = threading.Thread(
         target=lambda: red_ctrl.run_loop(max_wall_time_sec=max_wall_time_sec),
         daemon=True
