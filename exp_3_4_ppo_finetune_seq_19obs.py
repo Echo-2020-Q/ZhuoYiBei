@@ -25,7 +25,7 @@ class RecurrentActorCritic(nn.Module):
     """
 
     def __init__(self, in_dim, cont_dim, bin_dim, rnn_type="gru",
-                 hidden_size=256, num_layers=1, dropout=0.0):
+                 hidden_size=256, num_layers=2, dropout=0.0):
         super().__init__()
         self.rnn_type = rnn_type
         rnn_cls = {"gru": nn.GRU, "lstm": nn.LSTM}[rnn_type]
@@ -84,6 +84,14 @@ class PPOAgent:
         self.v_clip = v_clip
         self.target_kl = target_kl
 
+        # 先设置这些默认值，后面若 ckpt 有会覆盖
+        self.bc_kl_coef = bc_kl_coef
+        self._update_steps = 0
+        self.ent_coef = ent_coef
+        self.ent_coef_min = 0.0001
+        self.total_updates_for_anneal = 200
+        self.base_lr = lr
+
         # === 保存目录 vs 加载目录 ===
         self.save_dir = bc_dir
         load_dir = init_load_dir or bc_dir
@@ -104,7 +112,7 @@ class PPOAgent:
         self.obs_mean = np.array([meta["obs_mean"][c] for c in self.obs_cols], np.float32)
         self.obs_std = np.array([meta["obs_std"][c] for c in self.obs_cols], np.float32)
 
-        # === 运行时观测维度（19*4=76），将 64→76 补齐到新维度 ===
+        # === 运行时观测维度（19*4=76）===
         self.runtime_obs_dim = 19 * 4
         if self.obs_mean.shape[0] != self.runtime_obs_dim:
             pad = self.runtime_obs_dim - self.obs_mean.shape[0]
@@ -134,64 +142,115 @@ class PPOAgent:
             dropout=m["dropout"],
         ).to(self.device)
 
-        # 载入权重（允许输入层形状不匹配）
+        # 载入权重（自动识别 GRU/LSTM & 兼容加载）
         ckpt_path = os.path.join(load_dir, "seq_policy.pt.online")
         pt_path = os.path.join(load_dir, "seq_policy.pt")
         ckpt = None
+        state = None
+        src_path = None
+
         if os.path.exists(ckpt_path):
             ckpt = torch.load(ckpt_path, map_location=self.device)
-            self.net.load_state_dict(ckpt["net"], strict=False)
-            print(f"[PPOAgent] Loaded ONLINE checkpoint from: {ckpt_path}")
+            src_path = ckpt_path
+            state = ckpt["net"] if isinstance(ckpt, dict) and "net" in ckpt else ckpt
+            print(f"[PPOAgent] Found ONLINE checkpoint: {ckpt_path}")
         elif os.path.exists(pt_path):
-            bc_state = torch.load(pt_path, map_location=self.device)
-            self.net.load_state_dict(bc_state, strict=False)
-            print(f"[PPOAgent] Loaded BC init from: {pt_path}")
+            ckpt = torch.load(pt_path, map_location=self.device)
+            src_path = pt_path
+            state = ckpt["net"] if isinstance(ckpt, dict) and "net" in ckpt else ckpt
+            print(f"[PPOAgent] Found BC checkpoint: {pt_path}")
         else:
             raise FileNotFoundError(f"No checkpoint found under {load_dir} (tried .online and .pt)")
 
-        # 参考网络（KL 用），同输入维度
+        def _infer_rnn_type_from_state(state_dict, hidden_size):
+            w = state_dict.get("rnn.weight_ih_l0", None)
+            if w is None:
+                return None
+            gates = w.shape[0] // int(hidden_size)
+            if gates == 3:
+                return "gru"
+            elif gates == 4:
+                return "lstm"
+            return None
+
+        inferred_type = _infer_rnn_type_from_state(state, hidden_size=m["hidden_size"])
+        if inferred_type is not None and inferred_type != getattr(self.net, "rnn_type", None):
+            print(f"[PPOAgent] Detected ckpt RNN = {inferred_type} by shape; "
+                  f"current model = {self.net.rnn_type}. Rebuilding to match ckpt...")
+            self.net = RecurrentActorCritic(
+                in_dim=new_in_dim,
+                cont_dim=m["cont_dim"],
+                bin_dim=m["bin_dim"],
+                rnn_type=inferred_type,
+                hidden_size=m["hidden_size"],
+                num_layers=m["num_layers"],
+                dropout=m["dropout"],
+            ).to(self.device)
+
+        curr = self.net.state_dict()
+        compatible = {k: v for k, v in state.items() if (k in curr and v.shape == curr[k].shape)}
+        skipped = [k for k in state.keys() if k not in compatible]
+        curr.update(compatible)
+        self.net.load_state_dict(curr, strict=True)
+        print(f"[PPOAgent] Loaded {len(compatible)} tensors from {src_path}; "
+              f"skipped {len(skipped)} due to shape mismatch.")
+
+        # 参考网络（KL 用），结构与 self.net 一致
         self.ref = RecurrentActorCritic(
             in_dim=new_in_dim,
             cont_dim=m["cont_dim"],
             bin_dim=m["bin_dim"],
-            rnn_type=m["rnn_type"],
+            rnn_type=self.net.rnn_type,
             hidden_size=m["hidden_size"],
             num_layers=m["num_layers"],
             dropout=0.0,
         ).to(self.device)
-        self.ref.load_state_dict(self.net.state_dict(), strict=False)
+        self.ref.load_state_dict(self.net.state_dict(), strict=True)
         self.ref.eval()
         for p in self.ref.parameters():
             p.requires_grad_(False)
+
+        # 如果 ckpt 里带有 log_std/opt/bc_kl_coef/update_steps，记录下来稍后恢复
+        if isinstance(ckpt, dict):
+            try:
+                if "log_std" in ckpt:
+                    self._restore_log_std_from_ckpt = ckpt["log_std"].to(self.device)
+                if "opt" in ckpt:
+                    self._restore_opt_state_dict = ckpt["opt"]
+                # 这里会安全覆盖，因为我们前面已给了默认值
+                self.bc_kl_coef = ckpt.get("bc_kl_coef", self.bc_kl_coef)
+                self._update_steps = ckpt.get("update_steps", self._update_steps)
+            except Exception as _e:
+                print(f"[PPOAgent] Optional optimizer/log_std restore note: {_e}")
 
         # 可学习的 log_std（对连续头）
         self.log_std = nn.Parameter(
             torch.full((len(self.cont_cols),), math.log(std_init), device=self.device)
         )
 
-        # 优化器 & 退火相关
-        self.base_lr = lr
+        # 优化器
         self.opt = torch.optim.Adam(list(self.net.parameters()) + [self.log_std], lr=self.base_lr)
-        self.ent_coef = ent_coef
-        self.ent_coef_min = 0.0001
-        self.total_updates_for_anneal = 200
-        self.bc_kl_coef = bc_kl_coef
-        self._update_steps = 0
+
         # === 日志与曲线输出目录 ===
         self.plots_dir = os.path.join(self.save_dir, "plots")
         os.makedirs(self.plots_dir, exist_ok=True)
         self.train_log_csv = os.path.join(self.save_dir, "train_log.csv")
-        if ckpt is not None:
-            try:
-                if "log_std" in ckpt:
-                    with torch.no_grad():
-                        self.log_std.copy_(ckpt["log_std"].to(self.device))
-                if "opt" in ckpt:
-                    self.opt.load_state_dict(ckpt["opt"])
-                self.bc_kl_coef = ckpt.get("bc_kl_coef", self.bc_kl_coef)
-                self._update_steps = ckpt.get("update_steps", self._update_steps)
-            except Exception:
-                pass
+
+        # 恢复 log_std / 优化器（若有）
+        try:
+            if hasattr(self, "_restore_log_std_from_ckpt"):
+                with torch.no_grad():
+                    if self._restore_log_std_from_ckpt.shape == self.log_std.shape:
+                        self.log_std.copy_(self._restore_log_std_from_ckpt)
+                del self._restore_log_std_from_ckpt
+        except Exception:
+            pass
+        try:
+            if hasattr(self, "_restore_opt_state_dict"):
+                self.opt.load_state_dict(self._restore_opt_state_dict)
+                del self._restore_opt_state_dict
+        except Exception:
+            pass
 
 
 
@@ -347,7 +406,7 @@ class PPOAgent:
             delta = float(rews[0, t]) + self.gamma * nextv * nextnonterm - float(vals[0, t])
             lastgaelam = delta + self.gamma * self.lam * nextnonterm * lastgaelam
             adv[0, t] = lastgaelam
-        ret = adv + vals
+            ret = adv + vals
 
         # 归一化优势
         adv_mean = adv.mean()
@@ -423,8 +482,7 @@ class PPOAgent:
             agg = dict(pg=[], v=[], ent=[], tot=[], kl_ref=[], kl_approx=[], clipfrac=[])
 
             for idxs in splits:
-                t0 = int(idxs[0]);
-                t1 = int(idxs[-1]) + 1
+                t0 = int(idxs[0]); t1 = int(idxs[-1]) + 1
                 obs = obs_all[:, t0:t1, :]  # [1,τ,D]
                 act_c = act_c_all[:, t0:t1, :]  # [1,τ,Cc]
                 act_b = act_b_all[:, t0:t1, :]  # [1,τ,Cb]

@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""exp3.5_PPO_try.py
+"""exp3.7_PPO19_reward.py
 批量采集多轮（例如 1000 轮）对抗的 obs64+act16 数据，并在线更新 PPO。
 - 每轮写 runs/<timestamp>/ep_XXXX.csv 与 manifest.json
 - 攻击逻辑：PPO 只产出 (rate, direct, vz, fire intent)，fire 作为“意图位”
@@ -35,6 +35,9 @@ import torch as _torch
 from torch import nn as _nn
 
 # ==================== 你的原始常量（可按需调整） ====================
+# ===== 固定策略：关闭在线训练与保存 =====
+TRAIN_PPO = False
+
 DESTROYED_FLAG = "DAMAGE_STATE_DESTROYED"
 RED_IDS = [10091, 10084, 10085, 10086]
 
@@ -74,6 +77,9 @@ class LossLogger:
         self.csv_path = os.path.join(self.out_root, "loss_history.csv")
         self.global_step = 0
         self._csv_inited = False
+        # === NEW: per-episode summary ===
+        self.ep_csv_path = os.path.join(self.out_root, "episode_summary.csv")
+        self._ep_csv_inited = False
 
     def _ensure_header(self):
         import csv, os
@@ -81,11 +87,18 @@ class LossLogger:
             return
         with open(self.csv_path, "w", newline="", encoding="utf-8") as f:
             w = csv.writer(f)
-            w.writerow([
-                "global_step", "episode", "epoch_in_update",
-                "total_loss", "pg_loss", "v_loss"
-            ])
+            w.writerow(["global_step", "episode", "epoch_in_update", "total_loss", "pg_loss", "v_loss"])
         self._csv_inited = True
+
+    # === NEW: episode summary header ===
+    def _ensure_ep_header(self):
+        import csv, os
+        if self._ep_csv_inited and os.path.exists(self.ep_csv_path):
+            return
+        with open(self.ep_csv_path, "w", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            w.writerow(["episode", "return", "len_steps", "blue_kills", "red_losses"])
+        self._ep_csv_inited = True
 
     def append_update_stats(self, episode_idx: int, out: dict):
         import csv
@@ -93,30 +106,36 @@ class LossLogger:
         if not stats:
             return
         self._ensure_header()
-
         rows = []
         for ei, s in enumerate(stats, start=1):
             self.global_step += 1
             rows.append([
-                self.global_step,
-                int(episode_idx),
-                int(ei),
+                self.global_step, int(episode_idx), int(ei),
                 float(s.get("loss_total", 0.0)),
                 float(s.get("pg_loss", 0.0)),
                 float(s.get("v_loss", 0.0)),
             ])
-
         with open(self.csv_path, "a", newline="", encoding="utf-8") as f:
             csv.writer(f).writerows(rows)
+        # 画损失曲线（里边会顺带尝试叠加 reward）
+        try:
+            self.plot_curves()
+        except Exception as e:
+            print("[LossLogger] plot_curves failed:", e, flush=True)
 
-        # 统一走这里画图（不要把画图代码塞进本函数）
+    # === NEW: 每回合结束调用，记录回报 ===
+    def append_episode_summary(self, episode_idx: int, ep_return: float, ep_len: int, blue_kills: int, red_losses: int):
+        import csv
+        self._ensure_ep_header()
+        with open(self.ep_csv_path, "a", newline="", encoding="utf-8") as f:
+            csv.writer(f).writerow([int(episode_idx), float(ep_return), int(ep_len), int(blue_kills), int(red_losses)])
+        # 画 reward 曲线
         try:
             self.plot_curves()
         except Exception as e:
             print("[LossLogger] plot_curves failed:", e, flush=True)
 
     def plot_curves(self):
-        # 在无显示环境下安全绘图
         try:
             import matplotlib
             matplotlib.use("Agg")
@@ -127,13 +146,14 @@ class LossLogger:
         import matplotlib.pyplot as plt
 
         xs, total, pg, v = [], [], [], []
-        with open(self.csv_path, "r", encoding="utf-8") as f:
-            r = csv.DictReader(f)
-            for row in r:
-                xs.append(int(row["global_step"]))
-                total.append(float(row["total_loss"]))
-                pg.append(float(row["pg_loss"]))
-                v.append(float(row["v_loss"]))
+        if os.path.exists(self.csv_path):
+            with open(self.csv_path, "r", encoding="utf-8") as f:
+                r = csv.DictReader(f)
+                for row in r:
+                    xs.append(int(row["global_step"]))
+                    total.append(float(row["total_loss"]))
+                    pg.append(float(row["pg_loss"]))
+                    v.append(float(row["v_loss"]))
 
         def smooth(arr, k=7):
             if k <= 1 or len(arr) < k:
@@ -145,23 +165,63 @@ class LossLogger:
                 out.append(sum(win) / len(win))
             return out
 
-        if not xs:  # 没数据就不画
-            return
+        if xs:
+            plt.figure(figsize=(9, 5), dpi=120)
+            ax = plt.gca()
+            ax.plot(xs, smooth(total), label="total_loss")
+            ax.plot(xs, smooth(pg),    label="pg_loss")
+            ax.plot(xs, smooth(v),     label="v_loss")
+            ax.set_xlabel("Global step (epoch count across episodes)")
+            ax.set_ylabel("Loss")
+            ax.set_title("PPO Training Loss (All Episodes)")
+            ax.grid(True, alpha=0.3)
 
-        plt.figure(figsize=(9, 5), dpi=120)
-        plt.plot(xs, smooth(total), label="total_loss")
-        plt.plot(xs, smooth(pg),    label="pg_loss")
-        plt.plot(xs, smooth(v),     label="v_loss")
-        plt.xlabel("Global step (epoch count across episodes)")
-        plt.ylabel("Loss")
-        plt.title("PPO Training Loss (All Episodes, simplified)")
-        plt.legend()
-        plt.grid(True, alpha=0.3)
-        out_png = os.path.join(self.out_root, "loss_over_episodes.png")
-        plt.tight_layout()
-        plt.savefig(out_png)
-        plt.close()
-        print(f"[LossLogger] Updated plot: {out_png}", flush=True)
+            # === NEW: 叠加回合回报（如有） ===
+            import os as _os
+            if _os.path.exists(self.ep_csv_path):
+                ep_ids, ep_returns = [], []
+                with open(self.ep_csv_path, "r", encoding="utf-8") as f:
+                    r2 = csv.DictReader(f)
+                    for row in r2:
+                        ep_ids.append(int(row["episode"]))
+                        ep_returns.append(float(row["return"]))
+                if ep_ids:
+                    ax2 = ax.twinx()
+                    ax2.plot(ep_ids, smooth(ep_returns), label="episode return", alpha=0.6)
+                    ax2.set_ylabel("Return")
+                    # 做个简单的双图例
+                    lines, labels = ax.get_legend_handles_labels()
+                    lines2, labels2 = ax2.get_legend_handles_labels()
+                    ax.legend(lines + lines2, labels + labels2, loc="best")
+
+            out_png = os.path.join(self.out_root, "loss_over_episodes.png")
+            plt.tight_layout()
+            plt.savefig(out_png)
+            plt.close()
+            print(f"[LossLogger] Updated plot: {out_png}", flush=True)
+
+        # 再单独存一张纯 reward 图（可选）
+        import os as _os
+        if _os.path.exists(self.ep_csv_path):
+            ep_ids, ep_returns = [], []
+            with open(self.ep_csv_path, "r", encoding="utf-8") as f:
+                r2 = csv.DictReader(f)
+                for row in r2:
+                    ep_ids.append(int(row["episode"]))
+                    ep_returns.append(float(row["return"]))
+            if ep_ids:
+                plt.figure(figsize=(9, 4), dpi=120)
+                plt.plot(ep_ids, smooth(ep_returns), label="episode return")
+                plt.xlabel("Episode")
+                plt.ylabel("Return")
+                plt.title("Episode Return")
+                plt.grid(True, alpha=0.3)
+                plt.legend()
+                out_png2 = os.path.join(self.out_root, "reward_over_episodes.png")
+                plt.tight_layout()
+                plt.savefig(out_png2)
+                plt.close()
+                print(f"[LossLogger] Updated plot: {out_png2}", flush=True)
 
 
 def _bearing_deg_from_A_to_B(lonA, latA, lonB, latB):
@@ -203,6 +263,13 @@ def _ang_norm(deg): return (float(deg) + 360.0) % 360.0
 def _ang_diff_abs(a, b):
     d = abs(_ang_norm(a) - _ang_norm(b))
     return d if d <= 180.0 else 360.0 - d
+
+def _clamp(x, lo, hi):
+    return lo if x < lo else hi if x > hi else x
+
+def _cosd(deg):
+    import math
+    return math.cos(math.radians(float(deg or 0.0)))
 
 def _bearing_deg_A_to_B(lonA, latA, lonB, latB):
     return _bearing_deg_from_A_to_B(lonA, latA, lonB, latB)
@@ -621,14 +688,18 @@ class RedForceController:
         self.MISSILE_THREAT_DIST_M = 50000.0
         self.MISSILE_BEARING_THRESH_DEG = 25.0
         self.EVASIVE_TURN_DEG = 90.0
-        self.EVASIVE_SPEED_MIN = 220.0
+        self.EVASIVE_SPEED_MIN = 160.0
         self.EVASIVE_DURATION_SEC = 30.0
         self.EVASIVE_COOLDOWN_SEC = 2.0
         self._missile_last_dist = {}
         self._missile_last = {}
         self._evasive_until = {}
         self._last_evasive_time = {}
-
+        # --- 全蓝已被锁定 -> 让最东边红机后撤机动 ---
+        self.EAST_MANEUVER_COOLDOWN_SEC = 10.0   # 触发后冷却，避免每秒重复触发
+        self.EAST_MANEUVER_DURATION_SEC = 20.0   # （如需扩展为持续窗口，可用）
+        self._east_maneuver_cooldown_until = 0.0 # 冷却时间戳（用 sim_time）
+        self._east_maneuver_until = {}  # 新增：rid -> sim_time 截止时间
         # --- 结束延迟 ---
         self._end_grace_until = None
         self._end_reason = ""
@@ -651,9 +722,60 @@ class RedForceController:
         self._policy_attack_intent = {int(r): 0 for r in red_ids}
         # 本秒是否已跑过策略（用于“每秒只下发一次”）
         self._last_policy_sec = -1
+        # 速度上限（动作与规避都会用来 clamp）
+        self.SPEED_CAP = 200.0
+
+        # 作战速度带（用于奖励 shaping）
+        self.SPEED_MIN = 80.0
+        self.SPEED_MAX = 200.0
+
+        # 规避时的最低提速目标（必须 ≤ 上限）
+        self.EVASIVE_SPEED_MIN = 160.0
+        self.HANDOVER_SEC = 270               # 接管时刻（仿真秒）
+        self.PRESET_SPEED = 180.0             # 预设控制器的巡航速度（在速度带内）
+        self.PRESET_VZ_KEEP = True            # 预设控制器是否保持原 vz（True）
 
         # === 新增：初始化 GRU 隐状态（B=1） ===
         self._ppo_h = None
+
+
+        # === Shaping & Regularization ===
+        self.gamma = 0.99
+
+        # 奖励权重（可按需微调；单步总 shaping 建议<=0.05~0.1）
+        self.lambda_ttl      = -0.001   # 生存时间成本（越快结束越好）
+        self.alpha_phi       = 0.6      # 势函数：距离权重
+        self.beta_phi        = 0.4      # 势函数：指向权重（cos对准）
+        self.lambda_lock_pos = +0.01    # 持续专注同一目标（每秒）
+        self.lambda_switch   = -0.02    # 频繁换目标（每次）
+        self.lambda_speed_ok = +0.005   # 速度落在作战带
+        self.lambda_speed_ng = -0.005   # 过慢或过快
+        self.lambda_vz_jitter= -0.002   # 垂直速度抖动罚
+        self.lambda_act_smooth = -0.003 # 动作抖动罚（相邻秒动作差的L2）
+        self.lambda_evade_good = +0.01  # 在威胁下朝远离/安全几何演化
+        self.lambda_evade_bad  = -0.02  # 在威胁下仍迎向/几何恶化
+        # === 探测网格覆盖奖励 ===
+        self.grid_N_lon = 100   # 横向格数
+        self.grid_N_lat = 100   # 纵向格数
+        self.radar_radius = 0.05  # 度 (约5km，可调)
+        self.visited_map = [[False for _ in range(self.grid_N_lat)] for _ in range(self.grid_N_lon)]
+        self.reward_per_cell = 0.05
+        self.max_reward_per_step = 2.0
+
+
+        # 速度带（米/秒）——按你仿真调参区间改
+        self.SPEED_MIN = 80.0
+        self.SPEED_MAX = 200.0
+
+        # shaping 运行时缓存
+        self._phi_prev = 0.0                 # 上一步势函数
+        self._last_act_full = None           # 上一步 PPO act 向量（用于动作平滑）
+        self._last_vz = {}                   # 上一步各机 vz
+        self._focus_target = {}              # rid -> (last_tid, consecutive_secs)
+        self._switch_count_step = 0          # 本步换目标次数
+        self._focused_secs_step = 0.0        # 本步累计专注秒数（归一到机数）
+        self._evade_good_last = 0.0          # 上一步规避“好”秒数
+        self._evade_bad_last  = 0.0          # 上一步规避“坏”秒数
 
         for rid in red_ids:
             try:
@@ -668,6 +790,42 @@ class RedForceController:
                 print(client.get_command_status(vuid))
             except Exception as e:
                 print(f"[Red] set_vehicle_vel({rid}) failed: {e}", flush=True)
+
+
+
+
+
+    def _coord_to_cell(self, lon, lat):
+        if lon is None or lat is None:
+            return None
+        x_ratio = (lon - BOUNDARY_RECT["min_x"]) / (BOUNDARY_RECT["max_x"] - BOUNDARY_RECT["min_x"])
+        y_ratio = (lat - BOUNDARY_RECT["min_y"]) / (BOUNDARY_RECT["max_y"] - BOUNDARY_RECT["min_y"])
+        if not (0 <= x_ratio <= 1 and 0 <= y_ratio <= 1):
+            return None
+        ix = int(x_ratio * self.grid_N_lon)
+        iy = int(y_ratio * self.grid_N_lat)
+        return (ix, iy)
+    def _exploration_reward(self, lon, lat):
+        from math import radians, cos
+        new_cells = []
+        cell = self._coord_to_cell(lon, lat)
+        if cell is None:
+            return 0.0
+        cx, cy = cell
+        # 粗糙：取雷达半径对应的格子范围
+        d_lon = int(self.radar_radius / ((BOUNDARY_RECT["max_x"] - BOUNDARY_RECT["min_x"]) / self.grid_N_lon))
+        d_lat = int(self.radar_radius / ((BOUNDARY_RECT["max_y"] - BOUNDARY_RECT["min_y"]) / self.grid_N_lat))
+        for dx in range(-d_lon, d_lon + 1):
+            for dy in range(-d_lat, d_lat + 1):
+                ix, iy = cx + dx, cy + dy
+                if 0 <= ix < self.grid_N_lon and 0 <= iy < self.grid_N_lat:
+                    if not self.visited_map[ix][iy]:
+                        self.visited_map[ix][iy] = True
+                        new_cells.append((ix, iy))
+        if new_cells:
+            reward = min(self.max_reward_per_step, self.reward_per_cell * len(new_cells))
+            return reward
+        return 0.0
 
     # ---- BC 装载（可选，保留不使用） ----
     def _resolve_latest_seq_dir(self, root):
@@ -756,6 +914,127 @@ class RedForceController:
                     return t.get("lon"), t.get("lat")
         return (None, None)
 
+    def _maybe_maneuver_eastmost(self, visible_blue_targets, all_pos, vel_all, now_sim):
+        """
+        条件：所有“当前可见的蓝机”都已在 self.target_locks 里（即都被锁定）。
+        行为：选择最靠东（lon 最大）的在存活/未规避的红机，立即反向加速到上限。
+        """
+        # 1) 条件判定：可见蓝机非空 且 全部在锁定表中
+        if not visible_blue_targets:
+            return
+        all_locked = all(tid in self.target_locks for tid in visible_blue_targets)
+        if not all_locked:
+            return
+
+        # 冷却限制
+        if now_sim < float(self._east_maneuver_cooldown_until or 0.0):
+            return
+
+        # 2) 选最靠东的红机（lon 最大）
+        east_rid, east_lon = None, None
+        for rid in sorted(self.red_ids):
+            if rid in self.destroyed_red:
+                continue
+            if self._evasive_until.get(rid, 0.0) > now_sim:
+                continue
+            rp = all_pos.get(rid)
+            if not rp or getattr(rp, "x", None) is None:
+                continue
+            lon = float(rp.x)
+            if (east_lon is None) or (lon > east_lon):
+                east_lon, east_rid = lon, rid
+
+        if east_rid is None:
+            return
+
+        # 3) 计算当前航向并反向（+180°），速度打到上限
+        v_me = vel_all.get(east_rid) if vel_all else None
+        _, heading = _direct_rate_from_vx_vy(
+            getattr(v_me, "vx", 0.0) if v_me else 0.0,
+            getattr(v_me, "vy", 0.0) if v_me else 0.0
+        )
+        reverse_heading = _ang_norm((heading if heading is not None else 0.0) + 180.0)
+        speed_cmd = float(self.SPEED_CAP)
+        vz_keep = float(getattr(v_me, "vz", 0.0) if v_me else 0.0)
+
+        try:
+            vcmd = rflysim.Vel()
+            vcmd.rate   = speed_cmd              # 速度
+            vcmd.direct = reverse_heading        # 航向：反向
+            vcmd.vz     = vz_keep                # 保持当前升降
+            uid = self.client.set_vehicle_vel(east_rid, vcmd)
+            self._east_maneuver_until[east_rid] = float(now_sim) + float(self.EAST_MANEUVER_DURATION_SEC)
+            self._east_maneuver_cooldown_until = float(now_sim) + float(self.EAST_MANEUVER_COOLDOWN_SEC)
+
+            self.recorder.mark_vel_cmd(east_rid, rate=vcmd.rate, direct=vcmd.direct, vz=vcmd.vz, sim_time=now_sim)
+            print(f"[EAST-MANEUVER] rid={east_rid} lon={east_lon:.6f} -> reverse to {vcmd.direct:.1f}°, speed={vcmd.rate:.1f}", flush=True)
+        except Exception as e:
+            print(f"[EAST-MANEUVER] set_vehicle_vel({east_rid}) failed: {e}", flush=True)
+
+        # 4) 设置冷却，避免下一秒又触发
+        self._east_maneuver_cooldown_until = float(now_sim) + float(self.EAST_MANEUVER_COOLDOWN_SEC)
+
+    def _preset_controller_tick(self, red_ids, vis, all_pos, vel_all, sim_sec):
+        """
+        预设控制器（PPO 接管前使用）：
+        - 若能看见蓝机：朝最近蓝机的 LOS 航向飞行，速度保持在 PRESET_SPEED
+        - 若看不见蓝机：保持当前航向，速度保持在 PRESET_SPEED
+        - vz：保持当前 vz（可选）
+        同时把 PPO 的“意图位”清零，以便后面的两阶段打击逻辑只走基线部分。
+        """
+        for rid in sorted(red_ids):
+            my_p = all_pos.get(rid)
+            v_me = vel_all.get(rid)
+            if not my_p or getattr(my_p, "x", None) is None or getattr(my_p, "y", None) is None:
+                continue
+            my_lon, my_lat = float(my_p.x), float(my_p.y)
+
+            # 找最近蓝机
+            nearest_tid, nearest_d = None, None
+            for t in vis.get(rid, []) or []:
+                tid = t.get("target_id")
+                if tid is None or int(tid) < 10000:   # 跳过导弹
+                    continue
+                lonB, latB = t.get("lon"), t.get("lat")
+                if lonB is None or latB is None:
+                    continue
+                try:
+                    dd = self.client.get_distance_by_lon_lat(Position(x=my_lon, y=my_lat, z=0),
+                                                             Position(x=lonB, y=latB, z=0))
+                except Exception:
+                    dd = None
+                if dd is not None and (nearest_d is None or dd < nearest_d):
+                    nearest_d, nearest_tid = float(dd), int(tid)
+
+            # 决定航向
+            if nearest_tid is not None:
+                nb_lon, nb_lat = self._get_target_pos(nearest_tid, vis, all_pos)
+                if (nb_lon is not None) and (nb_lat is not None):
+                    heading_cmd = _bearing_deg_from_A_to_B(my_lon, my_lat, nb_lon, nb_lat)
+                else:
+                    # 如果拿不到坐标，用当前航向兜底
+                    _, heading_cmd = _direct_rate_from_vx_vy(getattr(v_me, "vx", 0.0), getattr(v_me, "vy", 0.0))
+            else:
+                # 看不见蓝机：保持当前航向
+                _, heading_cmd = _direct_rate_from_vx_vy(getattr(v_me, "vx", 0.0), getattr(v_me, "vy", 0.0))
+
+            # 速度与 vz
+            speed_cmd = min(self.SPEED_CAP, max(self.SPEED_MIN, float(self.PRESET_SPEED)))
+            vz_cmd = float(getattr(v_me, "vz", 0.0)) if (self.PRESET_VZ_KEEP and v_me is not None) else 0.0
+
+            try:
+                vcmd = rflysim.Vel()
+                vcmd.rate   = speed_cmd
+                vcmd.direct = float(heading_cmd or 0.0) % 360.0
+                vcmd.vz     = vz_cmd
+                uid = self.client.set_vehicle_vel(rid, vcmd)
+                self.recorder.mark_vel_cmd(rid, rate=vcmd.rate, direct=vcmd.direct, vz=vcmd.vz, sim_time=sim_sec)
+            except Exception as e:
+                print(f"[PRESET] set_vehicle_vel({rid}) failed: {e}", flush=True)
+
+            # 预设期不允许打击（意图位=0），仍保留后面的“基线回落”逻辑（两阶段里的第二阶段）
+            self._policy_attack_intent[rid] = 0
+
     def _fetch_score_with_retry(self, tries=20, wait=0.2, where="(unknown)"):
         score_obj = None
         for _ in range(tries):
@@ -834,6 +1113,13 @@ class RedForceController:
         self._update_destroyed_from_situ()
         sim_t = self.client.get_sim_time()
         sim_sec = int(sim_t)
+        ppo_active = (sim_sec >= int(self.HANDOVER_SEC))
+        if (sim_sec == int(self.HANDOVER_SEC)) and not getattr(self, "_handover_inited", False):
+            self._ppo_h = None
+            self._phi_prev = 0.0
+            self._last_act_full = None
+            self._handover_inited = True
+            print(f"[HANDOVER] t={sim_sec}s: PPO ", flush=True)
         self._score_counter = getattr(self, "_score_counter", 0) + 1
         if self._score_counter % 5 == 0:
             try: self._score_cache = self.client.get_score() or None
@@ -942,6 +1228,77 @@ class RedForceController:
                     vel_meas=vel_meas
                 )
                 obs_concat.extend(obs19)
+                # === 为 shaping 收集：最近目标ID、角度误差、速度带、vz 抖动 ===
+                # 最近可攻击（可见）蓝机ID
+                nearest_tid, nearest_d = None, None
+                if tracks and (my_lon is not None) and (my_lat is not None):
+                    for t in tracks:
+                        tid_c = t.get("target_id")
+                        if tid_c is None or int(tid_c) < 10000:  # 跳过导弹
+                            continue
+                        lonB, latB = t.get("lon"), t.get("lat")
+                        if lonB is None or latB is None:
+                            continue
+                        try:
+                            dd = self.client.get_distance_by_lon_lat(Position(x=my_lon, y=my_lat, z=0),
+                                                                     Position(x=lonB, y=latB, z=0))
+                        except Exception:
+                            dd = None
+                        if dd is not None and (nearest_d is None or dd < nearest_d):
+                            nearest_d, nearest_tid = float(dd), int(tid_c)
+
+                # 我机当前航向（由测得 vx,vy）
+                my_heading_deg = None
+                if vel_meas is not None:
+                    _, my_heading_deg = _direct_rate_from_vx_vy(getattr(vel_meas, "vx", 0.0),
+                                                                getattr(vel_meas, "vy", 0.0))
+                # 最近蓝机的 LOS 方位（若有）
+                bearing_to_nb = None
+                if nearest_tid is not None and (my_lon is not None) and (my_lat is not None):
+                    nb_lon, nb_lat = self._get_target_pos(nearest_tid, vis, all_pos)
+                    if (nb_lon is not None) and (nb_lat is not None):
+                        bearing_to_nb = _bearing_deg_from_A_to_B(my_lon, my_lat, nb_lon, nb_lat)
+
+                # 角度误差（度）
+                ang_err_deg = None
+                if (my_heading_deg is not None) and (bearing_to_nb is not None):
+                    ang_err_deg = _ang_diff_abs(my_heading_deg, bearing_to_nb)
+
+                # 写入临时容器供本步整合（以 rid 为键）
+                if not hasattr(self, "_shaping_cache"):
+                    self._shaping_cache = {}
+                self._shaping_cache[int(rid)] = {
+                    "nearest_d": float(nearest_d) if nearest_d is not None else None,
+                    "ang_err_deg": float(ang_err_deg) if ang_err_deg is not None else None,
+                    "nearest_tid": int(nearest_tid) if nearest_tid is not None else None,
+                }
+
+                # 速度标量与速度带统计
+                v_scalar = math.sqrt(float(getattr(vel_meas, "vx", 0.0) or 0.0)**2 + float(getattr(vel_meas, "vy", 0.0) or 0.0)**2)
+                in_band = (self.SPEED_MIN <= v_scalar <= self.SPEED_MAX)
+                band_key = "_speed_band_hits"
+                setattr(self, band_key, getattr(self, band_key, 0) + (1 if in_band else 0))
+                setattr(self, "_speed_total", getattr(self, "_speed_total", 0) + 1)
+
+                # 垂直速度抖动
+                vz_now = float(getattr(vel_meas, "vz", 0.0) or 0.0)
+                last_vz = self._last_vz.get(rid, vz_now)
+                setattr(self, "_vz_abs_diff_sum", getattr(self, "_vz_abs_diff_sum", 0.0) + abs(vz_now - last_vz))
+                self._last_vz[rid] = vz_now
+
+                # 专注/换目标统计（以“最近蓝机”作为轻量 proxy）
+                last_pair = self._focus_target.get(rid, (None, 0.0))
+                last_tid, consec = last_pair
+                if nearest_tid is not None:
+                    if last_tid == nearest_tid:
+                        consec += 1.0 * (1)  # 每秒 +1
+                    else:
+                        self._switch_count_step += 1
+                        consec = 1.0
+                    self._focus_target[rid] = (nearest_tid, consec)
+                # 归一化到“每机平均专注秒”
+                # 注意：每秒最后统一平均，这里先累加
+
 
                 # === 行为 4 维
                 act4 = self.recorder.pack_single_act4(rid, sim_sec, vel_meas=vel_meas, pos_meas=my_p)
@@ -965,67 +1322,172 @@ class RedForceController:
             self.recorder.latest_obs_vec = obs_concat
             self.recorder.latest_act_vec = act_concat
             self.recorder.add_vector_row(sim_sec, obs_concat, act_concat)
+            # —— 本秒统计：专注平均、速度带比例、垂直抖动均值（供奖励使用）——
+            focus_total = 0.0; focus_cnt = 0
+            for rid in sorted(self.red_ids):
+                pair = self._focus_target.get(rid, (None, 0.0))
+                focus_total += float(pair[1] if pair else 0.0)
+                focus_cnt += 1
+                # 本秒统计完，把“秒计数”只保留最后目标但不累计，方便下秒递增
+                if pair and pair[0] is not None:
+                    self._focus_target[rid] = (pair[0], 0.0)
+            self._focused_secs_step = (focus_total / max(1, focus_cnt))
+
+            self._speed_band_ratio = (getattr(self, "_speed_band_hits", 0) / max(1, getattr(self, "_speed_total", 1)))
+            self._speed_off_ratio  = 1.0 - self._speed_band_ratio
+            self._vz_abs_diff_mean = (getattr(self, "_vz_abs_diff_sum", 0.0) / max(1, focus_cnt))
+
+            # 清零计数（供下一秒重新累计）
+            setattr(self, "_speed_band_hits", 0)
+            setattr(self, "_speed_total", 0)
+            setattr(self, "_vz_abs_diff_sum", 0.0)
+
             self._last_logged_sec = sim_sec
 
         # ——【每秒一次】用 PPO 产生 4×act4，并补“上一秒”的奖励 —— #
         try:
             if sim_sec != getattr(self, "_last_policy_sec", -1) and self.recorder.latest_obs_vec is not None:
                 # 先给上一条样本补奖励
-                if self._last_step_sec is not None and self.traj:
-                    blue_k, red_k = len(self.destroyed_blue), len(self.destroyed_red)
-                    d_blue = blue_k - self._last_counts["blue"]
-                    d_red  = red_k  - self._last_counts["red"]
-                    rew = d_blue * self.REW_BLUE_KILL + d_red * self.REW_RED_LOSS
-                    nf_penalty = 0.0
-                    for rid in sorted(self.red_ids):
-                        rp = all_pos.get(rid)
-                        if rp and getattr(rp, "x", None) is not None and getattr(rp, "y", None) is not None:
-                            if _signed_dist_to_jam_boundary_m(self.client, float(rp.x), float(rp.y)) < 0.0:
-                                nf_penalty += self.REW_NOFLY_PER_SEC
-                    rew += nf_penalty
-                    self.traj[-1]["rew"] = float(rew)
-                    self._last_counts = {"blue": blue_k, "red": red_k}
+                if ppo_active:
+                    if self._last_step_sec is not None and self.traj:
+                        blue_k, red_k = len(self.destroyed_blue), len(self.destroyed_red)
+                        d_blue = blue_k - self._last_counts["blue"]
+                        d_red  = red_k  - self._last_counts["red"]
+                        rew = d_blue * self.REW_BLUE_KILL + d_red * self.REW_RED_LOSS
+                        # ===== 新增：区域探索奖励 =====
+                        for rid in sorted(self.red_ids):
+                            rp = all_pos.get(rid)
+                            if rp and getattr(rp, "x", None) is not None and getattr(rp, "y", None) is not None:
+                                rew += self._exploration_reward(float(rp.x), float(rp.y))
 
-                # 本秒动作 —— 关键改动：传入/更新 GRU 隐状态
-                obs76 = _np.asarray(self.recorder.latest_obs_vec, dtype=_np.float32)
-                t_norm = (sim_sec - 0.0) / max(1.0, 300.0)
-                tfeat_full = _np.array([t_norm, math.sin(2*math.pi*t_norm), math.cos(2*math.pi*t_norm)], dtype=_np.float32)
-                tfeat = tfeat_full[: self.ppo.tdim]
-                a_full, V, logp, h1 = self.ppo.act(obs76, tfeat, h=self._ppo_h, explore=True)
-                self._ppo_h = h1
+                        # 禁飞区惩罚（原有）
+                        nf_penalty = 0.0
+                        for rid in sorted(self.red_ids):
+                            rp = all_pos.get(rid)
+                            if rp and getattr(rp, "x", None) is not None and getattr(rp, "y", None) is not None:
+                                if _signed_dist_to_jam_boundary_m(self.client, float(rp.x), float(rp.y)) < 0.0:
+                                    nf_penalty += self.REW_NOFLY_PER_SEC
+                        rew += nf_penalty
 
-                # 下发速度 + 设置“意图位”
-                red_list = sorted(self.red_ids)
-                for idx, rid in enumerate(red_list):
-                    a0, a1, a2, a3 = [float(a_full[idx * 4 + k]) for k in range(4)]
-                    vcmd = rflysim.Vel()
-                    vcmd.rate   = max(0.0, float(a1))       # direct(速度) -> 接口 rate
-                    vcmd.direct = float(a0) % 360.0         # rate(角度) -> 接口 direct
-                    vcmd.vz     = float(a2)
-                    now_sim = self.client.get_sim_time()
-                    if self._evasive_until.get(rid, 0.0) > now_sim:
+                        # ===== 新增：生存时间成本（鼓励更快结束，小量负值）=====
+                        alive_reds = len([rid for rid in self.red_ids if rid not in self.destroyed_red])
+                        rew += self.lambda_ttl * float(alive_reds)
 
-                        self._policy_attack_intent[rid] = 0
-                        continue
-                    try:
-                        uid = self.client.set_vehicle_vel(rid, vcmd)
-                        self.recorder.mark_vel_cmd(rid, rate=vcmd.rate, direct=vcmd.direct, vz=vcmd.vz, sim_time=now_sim)
-                    except Exception as e:
-                        print(f"[PPO] set_vehicle_vel({rid}) failed: {e}", flush=True)
-                    self._policy_attack_intent[rid] = 1 if int(a3) == 1 else 0
+                        # ===== 新增：Potential-based Shaping（距离+对准）
+                        # 计算当前势函数 Phi(s)
+                        phi_now = 0.0;
+                        cnt = 0
+                        for rid in sorted(self.red_ids):
+                            meta = getattr(self, "_shaping_cache", {}).get(int(rid), {})
+                            d = meta.get("nearest_d", None)
+                            ang_err = meta.get("ang_err_deg", None)
+                            if d is None or ang_err is None:
+                                continue
+                            # 距离归一/截断（越近越好）
+                            d_cap = BLUE_DIST_CAP if BLUE_DIST_CAP and BLUE_DIST_CAP > 1.0 else 70000.0
+                            d_norm = _clamp(d / d_cap, 0.0, 1.0)
+                            term_d = self.alpha_phi * (1.0 / (1.0 + d_norm))
+                            # 指向对准（cos最大为1）
+                            term_ang = self.beta_phi * _cosd(ang_err)
+                            phi_now += (term_d + term_ang);
+                            cnt += 1
+                        if cnt > 0:
+                            phi_now /= float(cnt)
+                            rew += (self.gamma * phi_now - (self._phi_prev or 0.0))
+                            self._phi_prev = phi_now
+                        else:
+                            # 无法观测到蓝机时，不改变 _phi_prev 以避免抖动
+                            pass
 
-                # 记录样本占位（奖励下一秒补）
-                self.traj.append({
-                    "obs":   obs76.copy(),
-                    "tfeat": tfeat.copy(),
-                    "act":   _np.asarray(a_full, dtype=_np.float32).copy(),
-                    "val":   float(V),
-                    "logp":  float(logp),
-                    "rew":   0.0,
-                    "done":  0.0,
-                })
-                self._last_step_sec = sim_sec
-                self._last_policy_sec = sim_sec
+                        # ===== 新增：锁定/专注 & 换目标惩罚 =====
+                        rew += (self.lambda_lock_pos * float(self._focused_secs_step))
+                        rew += (self.lambda_switch * float(self._switch_count_step))
+                        self._switch_count_step = 0  # 用一次清一次
+
+                        # ===== 新增：速度带与垂直速度抖动 =====
+                        rew += (self.lambda_speed_ok * float(getattr(self, "_speed_band_ratio", 0.0)))
+                        rew += (self.lambda_speed_ng * float(getattr(self, "_speed_off_ratio", 1.0)))
+                        rew += (self.lambda_vz_jitter * float(getattr(self, "_vz_abs_diff_mean", 0.0)))
+
+                        # ===== 新增：动作平滑（相邻秒动作向量 L2 均值）=====
+                        if self._last_act_full is not None and len(self._last_act_full) == len(self.traj[-1]["act"]):
+
+                            a_prev = _np.asarray(self._last_act_full, dtype=_np.float32)
+                            a_curr = _np.asarray(self.traj[-1]["act"], dtype=_np.float32)  # 注意：这是上条样本的动作
+                            l2 = float(_np.linalg.norm(a_curr - a_prev)) / max(1.0, float(len(a_curr)))
+                            rew += (self.lambda_act_smooth * l2)
+
+                        # ===== 新增：反导规避几何（上一秒统计）=====
+                        rew += (self.lambda_evade_good * float(self._evade_good_last))
+                        rew += (self.lambda_evade_bad * float(self._evade_bad_last))
+                        self._evade_good_last = 0.0
+                        self._evade_bad_last = 0.0
+
+                        # 落到上一条样本
+                        self.traj[-1]["rew"] = float(rew)
+                        self._last_counts = {"blue": blue_k, "red": red_k}
+
+                    # 本秒动作 —— 关键改动：传入/更新 GRU 隐状态
+                    obs76 = _np.asarray(self.recorder.latest_obs_vec, dtype=_np.float32)
+                    t_norm = (sim_sec - 0.0) / max(1.0, 300.0)
+                    tfeat_full = _np.array([t_norm, math.sin(2*math.pi*t_norm), math.cos(2*math.pi*t_norm)], dtype=_np.float32)
+                    tfeat = tfeat_full[: self.ppo.tdim]
+                    a_full, V, logp, h1 = self.ppo.act(obs76, tfeat, h=self._ppo_h, explore=True)
+                    # 记录本秒动作（供下一秒的平滑惩罚使用）
+                    self._last_act_full = list(a_full)
+
+                    self._ppo_h = h1
+
+                    # 下发速度 + 设置“意图位”
+                    red_list = sorted(self.red_ids)
+                    for idx, rid in enumerate(red_list):
+                        a0, a1, a2, a3 = [float(a_full[idx * 4 + k]) for k in range(4)]
+                        vcmd = rflysim.Vel()
+                        vcmd.rate   = max(0.0, float(a1))       # direct(速度) -> 接口 rate
+                        vcmd.direct = float(a0) % 360.0         # rate(角度) -> 接口 direct
+                        vcmd.vz     = float(a2)
+                        now_sim = self.client.get_sim_time()
+                        if self._evasive_until.get(rid, 0.0) > now_sim:
+                            self._policy_attack_intent[rid] = 0
+                            continue
+                        # 后撤持续窗口：屏蔽 PPO，并“按需刷新”上一条反向指令（避免过期）
+                        if self._east_maneuver_until.get(rid, 0.0) > now_sim:
+                            self._policy_attack_intent[rid] = 0  # 不让打
+                            last = self.recorder.last_vel_cmd.get(int(rid))
+                            try:
+                                # 如果上一条速度命令时间已久，主动重发一次，避免控制器把速度慢慢拉回去
+                                if (not last) or (now_sim - float(last.get("t", 0.0))) >= 0.8:
+                                    vcmd = rflysim.Vel()
+                                    # 兜底：保持上次航向/升降，速度顶到上限
+                                    vcmd.rate = min(self.SPEED_CAP,
+                                                    float(last.get("rate", self.SPEED_CAP)) if last else self.SPEED_CAP)
+                                    vcmd.direct = float(last.get("direct", 0.0) if last else 0.0) % 360.0
+                                    vcmd.vz = float(last.get("vz", 0.0) if last else 0.0)
+                                    uid = self.client.set_vehicle_vel(rid, vcmd)
+                                    self.recorder.mark_vel_cmd(rid, rate=vcmd.rate, direct=vcmd.direct, vz=vcmd.vz,
+                                                               sim_time=now_sim)
+                            except Exception as e:
+                                print(f"[EAST-MANEUVER] refresh cmd for {rid} failed: {e}", flush=True)
+                            continue  # 关键：跳过 PPO 对该机的下发
+                        try:
+                            uid = self.client.set_vehicle_vel(rid, vcmd)
+                            self.recorder.mark_vel_cmd(rid, rate=vcmd.rate, direct=vcmd.direct, vz=vcmd.vz, sim_time=now_sim)
+                        except Exception as e:
+                            print(f"[PPO] set_vehicle_vel({rid}) failed: {e}", flush=True)
+                        self._policy_attack_intent[rid] = 1 if int(a3) == 1 else 0
+
+                    # 记录样本占位（奖励下一秒补）
+                    self.traj.append({
+                        "obs":   obs76.copy(),
+                        "tfeat": tfeat.copy(),
+                        "act":   _np.asarray(a_full, dtype=_np.float32).copy(),
+                        "val":   float(V),
+                        "logp":  float(logp),
+                        "rew":   0.0,
+                        "done":  0.0,
+                    })
+                    self._last_step_sec = sim_sec
+                    self._last_policy_sec = sim_sec
         except Exception as e:
             print("[PPO] policy step failed:", e, flush=True)
 
@@ -1205,6 +1667,15 @@ class RedForceController:
                             f"reason={reason}",
                             flush=True
                         )
+                # === 统计规避几何“好/坏”一秒（累加到 _evade_*_last，下一秒结算）
+                if in_threat:
+                    if (ang_diff is not None) and (ang_diff <= self.MISSILE_BEARING_THRESH_DEG):
+                        # 坏几何（迎向）
+                        self._evade_bad_last  = float(self._evade_bad_last  + 1.0 / max(1, len(self.red_ids)))
+                    else:
+                        # 好几何（不是迎向）
+                        self._evade_good_last = float(self._evade_good_last + 1.0 / max(1, len(self.red_ids)))
+
                 if in_threat and approach_ok and cooldown_ok:
                     use_mdir = mdir if mdir is not None else (los_m2red or 0.0)
                     cand1 = _ang_norm(use_mdir + self.EVASIVE_TURN_DEG)
@@ -1222,11 +1693,13 @@ class RedForceController:
                         getattr(v_me, "vx", 0.0) if v_me else 0.0,
                         getattr(v_me, "vy", 0.0) if v_me else 0.0
                     )
-                    v_direct_cmd = max(float(v_direct_now or 0.0), self.EVASIVE_SPEED_MIN)
+                    v_direct_cmd = min(self.SPEED_CAP, max(float(v_direct_now or 0.0), self.EVASIVE_SPEED_MIN))
+
                     vz_keep = getattr(v_me, "vz", 0.0) if v_me else 0.0
                     try:
                         vcmd = rflysim.Vel()
-                        vcmd.rate = float(v_direct_cmd)
+                        vcmd.rate = max(0.0, min(float(a1), self.SPEED_CAP))  # 速度 ∈ [0, 200]
+
                         vcmd.direct = float(evade_heading)
                         vcmd.vz = float(vz_keep)
                         uid = self.client.set_vehicle_vel(rid, vcmd)
@@ -1348,6 +1821,14 @@ class RedForceController:
             except Exception as e:
                 print(f"[Red] set_target({rid},{tid}) failed: {e}", flush=True); continue
 
+
+        # === 全蓝已被锁定 → 触发“最东红机后撤机动” ===
+        try:
+            self._maybe_maneuver_eastmost(visible_blue_targets, all_pos2, vel_all2, now)
+        except Exception as e:
+            print("[EAST-MANEUVER] failed:", e, flush=True)
+
+
     def run_loop(self, stop_when_paused=False, max_wall_time_sec=None):
         start_t = time.time()
         try:
@@ -1463,6 +1944,32 @@ def run_one_episode(client, plan_id, out_csv_path, max_wall_time_sec=360, min_wa
                 out = red_ctrl.ppo.update(red_ctrl.traj, epochs=4, minibatch=2)
                 if loss_logger is not None:
                     loss_logger.append_update_stats(episode_idx, out)
+                # === 统计并记录本回合回报 / 长度 / 击毁数 ===
+                try:
+                    if loss_logger is not None and hasattr(red_ctrl, "traj") and red_ctrl.traj:
+                        ep_return = sum(float(x.get("rew", 0.0)) for x in red_ctrl.traj)
+                        ep_len = len(red_ctrl.traj)
+                        blue_k = len(red_ctrl.destroyed_blue)
+                        red_k = len(red_ctrl.destroyed_red)
+                        loss_logger.append_episode_summary(episode_idx, ep_return, ep_len, blue_k, red_k)
+
+                        # 控制台打印（再给个最近10回合均值，如果文件里已有 >=10 条）
+                        import csv, os
+                        ma10 = None
+                        if os.path.exists(loss_logger.ep_csv_path):
+                            rs = []
+                            with open(loss_logger.ep_csv_path, "r", encoding="utf-8") as f:
+                                for i, row in enumerate(csv.DictReader(f), 1):
+                                    rs.append(float(row["return"]))
+                            if len(rs) >= 10:
+                                ma10 = sum(rs[-10:]) / 10.0
+
+                        msg = f"[EP{episode_idx}] return={ep_return:.3f} | len={ep_len} | blue_kills={blue_k} | red_losses={red_k}"
+                        if ma10 is not None:
+                            msg += f" | return_ma10={ma10:.3f}"
+                        print(msg, flush=True)
+                except Exception as e:
+                    print("[Logger] episode summary failed:", e, flush=True)
 
                 red_ctrl.ppo.save()  # -> ./bc_out_seq/seq_policy.pt.online
                 # 逐 epoch 展开打印（update 内部也会打印一次，这里让 manifest 更完整）

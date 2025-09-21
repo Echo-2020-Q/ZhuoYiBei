@@ -113,8 +113,8 @@ class SeqDataset(Dataset):
 
             # 时间特征
             t = df["t"].values.astype(np.float32)
-            t0, t1 = float(t.min()), float(t.max())
-            Tspan = max(1.0, t1 - t0)
+            t0 = float(t.min())
+            Tspan = 500.0
             t_norm = (t - t0) / Tspan
             feats = [t_norm]
             if "sin2pi" in time_feat or "norm+sin2pi+cos2pi" in time_feat:
@@ -187,12 +187,12 @@ class RNNPolicy(nn.Module):
             out["bin_logits"] = self.head_bin(Z)     # B,T,Cb
         return out, h_new
 
-# ---------------- train ----------------训练命令：python bc_train_seq.py --data_glob "runs/20250913_003049/*.csv"
+# ---------------- train ----------------训练命令：python bc_train_seq.py --data_glob "runs/Experts_0916/*.csv"
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--data_glob", required=True)
     ap.add_argument("--out_dir", default="./bc_out_seq")
-    ap.add_argument("--epochs", type=int, default=40)
+    ap.add_argument("--epochs", type=int, default=150)
     ap.add_argument("--batch_size", type=int, default=8)
     ap.add_argument("--lr", type=float, default=1e-3)
     ap.add_argument("--weight_decay", type=float, default=1e-4)

@@ -1,5 +1,9 @@
 # -*- coding: utf-8 -*-
 """
+#python your_script.py --outdir r"D:\ZhuoYiBei\runs\experts"
+#python another_script.py --outdir r"D:\ZhuoYiBei\runs\experts"
+#python third_script.py --outdir r"D:\ZhuoYiBei\runs\experts"
+
 批量采集多轮（例如 1000 轮）对抗的 obs64+act16 数据。
 - 每轮将数据写入 runs/<timestamp>/ep_XXXX.csv
 - 写入一个 runs/<timestamp>/manifest.json 索引
@@ -33,6 +37,8 @@ import re
 import threading
 from collections import defaultdict
 from datetime import datetime
+import argparse
+import glob
 
 import rflysim
 from rflysim import RflysimEnvConfig, Position
@@ -41,14 +47,19 @@ from BlueForce import CombatSystem
 
 # ==================== 你的原始常量（可按需调整） ====================
 DESTROYED_FLAG = "DAMAGE_STATE_DESTROYED"
-RED_IDS = [10091, 10084, 10085, 10086]
+
+RED_IDS = [10108, 10101, 10102, 10103]
 
 AMMO_MAX = 8
 ATTACK_COOLDOWN_SEC = 2.0
 SCAN_INTERVAL_SEC = 0.1
-LOCK_SEC = 40.0
+LOCK_SEC = 50.0
 BLUE_SIDE_CODE = 2
 DESTROY_CODES = {1}
+BLUE_TOTAL = 4   # 蓝机总数（你的场景是4，如有变化同步修改）
+ATTACK_EVENT_RETENTION_SEC = 60.0    # 记录器保留“确认打击成功”的时间窗口（原来是10s）
+SPECIAL_BURN_WINDOW_SEC     = 20.0   # 触发“反向满速”的最近成功发射窗口（<= 上面这个）
+
 
 vel_0 = rflysim.Vel()
 vel_0.vz = 150
@@ -61,11 +72,12 @@ FULL_SPEED = 200           # 全速
 EAST_HEADING_DEG = 90      # 向东
 BOOST_AFTER_SEC = 120.0     # 多少仿真秒后把另外三架提到全速
 # 初始速度（除 10085 外三架一开始较慢）
+
 INITIAL_SPEEDS = {
-  10085: 200,  # 指定：10085 开局即全速
-  10091: 80,
-  10084: 100,
-  10086: 80,
+  10108: 80,  # 指定：10085 开局即全速
+  10101: 100,
+  10102: 200,
+  10103: 80,
 }
 BOUNDARY_RECT = {
     "min_x": 101.07326442811694,
@@ -80,6 +92,214 @@ BLUE_DIST_CAP = 70000.0
 
 
 # ==================== 通用工具函数 ====================
+
+def hard_reset_world(client, max_wait_s=10.0):
+    """
+    强制彻底重置战场，并做健康检查，确保：
+      - 仿真时钟已回到起点（~0s）
+      - 场景内没有遗留导弹（id < 10000）
+      - 不再有上一局残留的可见航迹/锁定
+    成功返回 True；否则返回 False（上层放弃本局或再试一次）。
+    """
+    import time as _time
+
+    # 1) 先尽力停
+    try:
+        client.stop()
+    except Exception:
+        pass
+
+    # 2) 优先调用原生 reset / restart / reset_scene / reset_scenario
+    ok = False
+    for fn_name in ["reset", "reset_scene", "reset_scenario", "restart"]:
+        fn = getattr(client, fn_name, None)
+        if callable(fn):
+            try:
+                fn()
+                ok = True
+                print(f"[HardReset] client.{fn_name}() called.", flush=True)
+                break
+            except Exception as e:
+                msg = str(e)
+                if "容器正在运行" in msg or "already running" in msg.lower():
+                    ok = True
+                    print(f"[HardReset] client.{fn_name}(): container already running, continue.", flush=True)
+                    break
+                print(f"[HardReset] client.{fn_name}() failed: {e}", flush=True)
+
+    # 兜底：stop->start
+    if not ok:
+        try:
+            client.stop()
+        except Exception:
+            pass
+        _time.sleep(1.0)
+        try:
+            client.start()
+            ok = True
+            print("[HardReset] fallback stop()->start() used.", flush=True)
+        except Exception as e:
+            msg = str(e)
+            if "容器正在运行" in msg or "already running" in msg.lower():
+                ok = True
+                print("[HardReset] fallback start(): container already running, continue.", flush=True)
+            else:
+                print("[HardReset] fallback start failed:", e, flush=True)
+                return False
+
+    # 3) 健康检查：等待世界“干净”
+    t0 = _time.time()
+    while (_time.time() - t0) < float(max_wait_s):
+        try:
+            sim_t = float(client.get_sim_time() or 0.0)
+        except Exception:
+            sim_t = 0.0
+
+        # 读 situ / pos / visible，确认无导弹、无残留轨迹
+        try:
+            situ = client.get_situ_info() or {}
+        except Exception:
+            situ = {}
+        try:
+            pos_all = client.get_vehicle_pos() or {}
+        except Exception:
+            pos_all = {}
+        try:
+            vis = client.get_visible_vehicles() or {}
+        except Exception:
+            vis = {}
+
+        # 条件 A：仿真时钟已“回零”或很小
+        clock_ok = (sim_t <= 1.0)
+
+        # 条件 B：场景内无导弹（id < 10000）
+        def _has_missile():
+            # 先看 pos_all
+            for vid in pos_all.keys():
+                try:
+                    if int(vid) < 10000:
+                        return True
+                except Exception:
+                    pass
+            # 再看 situ
+            for _, info in (situ or {}).items():
+                try:
+                    _id = int(getattr(info, "id", None) if not isinstance(info, dict) else info.get("id"))
+                    if _id is not None and _id < 10000:
+                        return True
+                except Exception:
+                    pass
+            # 最后看 visible
+            from collections import deque
+            q = deque((vis or {}).values())
+            while q:
+                v = q.popleft()
+                if isinstance(v, dict):
+                    q.extend(v.values()); continue
+                if isinstance(v, (list, tuple)):
+                    for item in v:
+                        try:
+                            tid = int(item.get("target_id")) if isinstance(item, dict) else None
+                        except Exception:
+                            tid = None
+                        if tid is not None and tid < 10000:
+                            return True
+                # 其它类型忽略
+            return False
+
+        missiles_clean = (not _has_missile())
+
+        # 条件 C：可选——可见表里基本“空”或仅有无意义噪声
+        visible_ok = True  # 大多数环境重置后短时间内就是空；此处不强卡死
+
+        if clock_ok and missiles_clean and visible_ok:
+            print(f"[HardReset] clean world ready (sim_t={sim_t:.2f}s).", flush=True)
+
+            # 清理脚本层面的全局残留（稳妥起见）
+            try:
+                global JAM_RADIUS_M
+                JAM_RADIUS_M = None
+            except Exception:
+                pass
+
+            return True
+
+        _time.sleep(0.1)
+
+    print("[HardReset] world not clean enough within timeout.", flush=True)
+    return False
+
+
+def get_out_root_from_args():
+    """
+    统一输出目录：优先 --outdir；次选环境变量 RUNS_OUTDIR；最后默认 runs/shared
+    所有同时跑的脚本要指向同一个目录。
+    """
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--outdir", type=str, default=r"D:\PyCharm_Community_Edition_2024_01_04\Py_Projects\ZhuoYiBei\pythonProject1\runs\Experts_0916")
+    # 允许将 EPISODES、超时时间从命令行覆盖（可选）
+    parser.add_argument("--episodes", type=int, default=None)
+    parser.add_argument("--max_wall_time_per_ep", type=int, default=None)
+    parser.add_argument("--min_wall_time_per_ep", type=int, default=None)
+    args, _ = parser.parse_known_args()
+
+    outdir = args.outdir or os.environ.get("RUNS_OUTDIR") or os.path.join("runs", "shared")
+    os.makedirs(outdir, exist_ok=True)
+    return outdir, args
+
+def _alloc_next_ep_index(shared_dir):
+    """
+    在 shared_dir 下用 .ep.lock 实现跨进程互斥，安全递增 ep_counter.txt。
+    如果计数器不存在，会先扫描现有 ep_*.csv 获取起点。
+    返回：下一个可用的整数 ep（从 1 开始）
+    """
+    lock_path = os.path.join(shared_dir, ".ep.lock")
+    # 自旋抢锁：创建独占文件（O_EXCL 原子）
+    while True:
+        try:
+            lock_fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_RDWR)
+            break
+        except FileExistsError:
+            time.sleep(0.05 + random.uniform(0.0, 0.1))
+
+    try:
+        ctr_path = os.path.join(shared_dir, "ep_counter.txt")
+        if not os.path.exists(ctr_path):
+            # 第一次初始化计数器：看目录下已有的 ep_XXXX.csv，确定最大号
+            pat = os.path.join(shared_dir, "ep_*.csv")
+            max_ep = 0
+            for p in glob.glob(pat):
+                bn = os.path.basename(p)
+                m = re.match(r"ep_(\d{1,}).csv$", bn)
+                if m:
+                    try:
+                        max_ep = max(max_ep, int(m.group(1)))
+                    except Exception:
+                        pass
+            with open(ctr_path, "w", encoding="utf-8") as f:
+                f.write(str(max_ep))
+
+        # 读-改-写
+        try:
+            with open(ctr_path, "r", encoding="utf-8") as f:
+                cur = int((f.read() or "0").strip())
+        except Exception:
+            cur = 0
+        nxt = cur + 1
+        with open(ctr_path, "w", encoding="utf-8") as f:
+            f.write(str(nxt))
+    finally:
+        try:
+            os.close(lock_fd)
+        except Exception:
+            pass
+        try:
+            os.remove(lock_path)
+        except Exception:
+            pass
+
+    return nxt
+
 def _bearing_deg_from_A_to_B(lonA, latA, lonB, latB):
     import math
     if None in (lonA, latA, lonB, latB):
@@ -402,7 +622,7 @@ class RLRecorder:
     def mark_attack_success(self, red_id, sim_time):
         rid = int(red_id)
         self.attack_events[rid].append(float(sim_time))
-        self.attack_events[rid] = [t for t in self.attack_events[rid] if sim_time - t <= 10.0]
+        self.attack_events[rid] = [t for t in self.attack_events[rid] if sim_time - t <= ATTACK_EVENT_RETENTION_SEC]
 
     def mark_vel_cmd(self, red_id, rate, direct, vz, sim_time):
         self.last_vel_cmd[int(red_id)] = {
@@ -445,9 +665,69 @@ class RLRecorder:
 
 # ==================== 红方控制器（缩略自你上一版，逻辑一致） ====================
 class RedForceController:
+    def _radar_key_present(self, rid: int) -> bool:
+        """
+        经验做法：很多环境里雷达没开的话，该 rid 在 get_visible_vehicles() 的返回里就没有键。
+        这里用“是否有键”来判定雷达是否真正生效。
+        """
+        try:
+            vis_raw = self.client.get_visible_vehicles() or {}
+            # 直接看原始 keys，避免额外处理开销
+            keys = set()
+            for k in vis_raw.keys():
+                try:
+                    keys.add(int(k))
+                except Exception:
+                    pass
+            return int(rid) in keys
+        except Exception:
+            return False
+
+    def _enable_radar_reliably(self, rid: int, retries: int = 3, gap: float = 0.2) -> bool:
+        """
+        开雷达 + 校验；必要时做一次 0->1 的 toggle 清粘连。
+        """
+        for i in range(retries):
+            try:
+                uid = self.client.enable_radar(vehicle_id=rid, state=1)
+                print(f"[Red] enable_radar({rid},1) uid={uid}", flush=True)
+            except Exception as e:
+                print(f"[Red] enable_radar({rid},1) error: {e}", flush=True)
+            time.sleep(gap)
+
+            if self._radar_key_present(rid):
+                print(f"[Red] Radar ON confirmed for {rid}", flush=True)
+                return True
+
+            # 第一次失败后，做一次关再开的“摇一摇”
+            if i == 0:
+                try:
+                    self.client.enable_radar(vehicle_id=rid, state=0)
+                    print(f"[Red] enable_radar({rid},0) (toggle)", flush=True)
+                except Exception as e:
+                    print(f"[Red] enable_radar({rid},0) error: {e}", flush=True)
+                time.sleep(0.1)
+
+        print(f"[Red] Radar still OFF after retries for {rid}", flush=True)
+        return False
+
+    def _radar_watchdog_once(self):
+        """
+        一次性看门狗：启动 2 秒后检查所有红机的雷达键是否存在；不存在则补开。
+        """
+        time.sleep(2.0)
+        try:
+            for rid in self.red_ids:
+                if not self._radar_key_present(int(rid)):
+                    print(f"[RadarWatchdog] rid={rid} seems OFF; re-enable...", flush=True)
+                    self._enable_radar_reliably(int(rid), retries=3, gap=0.2)
+        except Exception as e:
+            print("[RadarWatchdog] check failed:", e, flush=True)
+
     def __init__(self, client, red_ids, out_csv_path):
         self.client = client
-        self.red_ids = set(int(x) for x in red_ids)
+        self.red_ids_seq = [int(x) for x in red_ids]  # 保留传入顺序
+        self.red_ids = set(self.red_ids_seq)  # 再转成 set 做集合操作
         self.ammo = {int(r): AMMO_MAX for r in red_ids}
         self.last_fire_time = {int(r): 0.0 for r in red_ids}
         self.assigned_target = {}
@@ -523,6 +803,14 @@ class RedForceController:
                 print(f"[INIT-SPEED] set_vehicle_vel({rid}) failed: {e}", flush=True)
 
         self._init_speed_done = True
+        # ⭐ 启动一次性雷达看门狗（2 秒后自检并补开）
+        threading.Thread(target=self._radar_watchdog_once, daemon=True).start()
+        # === “特殊飞机”定义：按 RED_IDS 升序取第3台 ===
+        # 原来的“特殊飞机”定义改成：
+        self._rid_third_sorted = self.red_ids_seq[2]  # 原始顺序的第3个 -> 这里就是 10094
+        print(f"[CONFIG] special_rid(third by original order) = {self._rid_third_sorted}", flush=True)
+        self._did_special_afterlock_burn = False          # 只触发一次
+
 
     # ---- 内部工具 ----
     def _estimate_msl_heading_speed(self, mid, lon_now, lat_now, t_now):
@@ -623,6 +911,56 @@ class RedForceController:
             self.recorder.dump_csv(self.out_csv_path)
         except Exception as e:
             print("[RL] dump_csv failed:", e, flush=True)
+    def _maybe_back_fullspeed_for_special(self, special_rid, vel_all2, now_sim):
+        """
+        条件：
+          A) 所有“剩余蓝机”均已被硬锁定（只看 self.target_locks，不算软锁）
+          B) special_rid 最近一次发射已确认成功（近几秒内）
+        动作：
+          让 special_rid 立刻把航向改为“当前航向+180°”，速度拉满 FULL_SPEED，vz 保持
+        """
+        if self._did_special_afterlock_burn:
+            return
+        if special_rid not in self.red_ids:
+            return
+
+        # A) “所有剩余蓝机已被锁定(硬锁)”判定
+        remaining_blue = max(0, BLUE_TOTAL - len(self.destroyed_blue))
+        if remaining_blue == 0:
+            return  # 已全灭，无需机动
+        locked_count = len(self.target_locks)  # 只看硬锁
+        if locked_count < remaining_blue:
+            return
+
+        # B) special_rid 最近一次发射已确认成功（时间窗内）
+        recent_ok_window = min(SPECIAL_BURN_WINDOW_SEC, SPECIAL_BURN_WINDOW_SEC)  # 秒
+        atk_times = self.recorder.attack_events.get(int(special_rid), [])
+        has_recent_ok_fire = any((now_sim - float(t)) <= recent_ok_window for t in atk_times)
+        if not has_recent_ok_fire:
+            return
+
+        # 计算“背向”航向并下发
+        v_me = vel_all2.get(int(special_rid)) if vel_all2 else None
+        if v_me is not None:
+            _, heading_now = _direct_rate_from_vx_vy(getattr(v_me, "vx", 0.0), getattr(v_me, "vy", 0.0))
+            back_heading = _ang_norm(heading_now + 180.0)
+            vz_keep = getattr(v_me, "vz", 0.0)
+        else:
+            # 兜底：如果拿不到当前速度，就以向东180°背向
+            back_heading = _ang_norm(EAST_HEADING_DEG + 180.0)
+            vz_keep = vel_0.vz
+
+        try:
+            vcmd = rflysim.Vel()
+            vcmd.rate = float(FULL_SPEED)      # 满速
+            vcmd.direct = float(back_heading)  # 背向
+            vcmd.vz = float(vz_keep)
+            self.client.set_vehicle_vel(int(special_rid), vcmd)
+            self.recorder.mark_vel_cmd(int(special_rid), rate=vcmd.rate, direct=vcmd.direct, vz=vcmd.vz, sim_time=now_sim)
+            self._did_special_afterlock_burn = True
+            print(f"[AFTER-LOCK BURN] t={now_sim:.1f}s rid={special_rid} -> BACK FULL SPEED: rate={vcmd.rate:.1f} direct={vcmd.direct:.1f} vz={vcmd.vz:.1f}", flush=True)
+        except Exception as e:
+            print(f"[AFTER-LOCK BURN] set_vehicle_vel({special_rid}) failed: {e}", flush=True)
 
     def _update_destroyed_from_situ(self, force=False):
         if self._ended:
@@ -1022,6 +1360,9 @@ class RedForceController:
         expired = [tid for tid, meta in self.target_locks.items() if now >= meta["until"]]
         for tid in expired:
             self.target_locks.pop(tid, None)
+        # ★ 检查是否满足“所有蓝机已被硬锁定 + 特殊飞机最近发射成功”，满足则让其立刻向后满速机动
+        self._maybe_back_fullspeed_for_special(self._rid_third_sorted, vel_all2, now)
+
 
         # === Missile Evasion: 识别导弹 & 判定威胁 & 触发躲避（含调试打印）===
         # === Missile Evasion: 识别导弹 & 判定威胁 & 触发躲避（含详细调试打印）===
@@ -1462,51 +1803,62 @@ def run_one_episode(client, plan_id, out_csv_path, max_wall_time_sec=360, min_wa
 
 # ==================== 改动点 3：main 精简每轮流程（不再二次 reset/start） ====================
 def main():
-    # === 可调参数 ===
+    # === 可调参数（保留原值，允许被命令行覆盖）===
     EPISODES = 1000
-    MAX_WALL_TIME_PER_EP = 600      # 每轮最多持续秒数（到时自动结束）
-    MIN_WALL_TIME_PER_EP = 10       # 少于该时长认为异常/无效轮
+    MAX_WALL_TIME_PER_EP = 600
+    MIN_WALL_TIME_PER_EP = 10
     HOST, PORT_CMD, PORT_DATA = "172.23.53.35", 16001, 18001
-    PLAN_ID = 107
+    PLAN_ID = 108
 
-    # 输出目录
-    run_tag = datetime.now().strftime("%Y%m%d_%H%M%S")
-    out_root = os.path.abspath(os.path.join("runs", run_tag))
-    os.makedirs(out_root, exist_ok=True)
-    print("[Runner] Output root:", out_root, flush=True)
+    # 统一输出目录
+    out_root, cli_args = get_out_root_from_args()
+    if cli_args.episodes is not None:
+        EPISODES = int(cli_args.episodes)
+    if cli_args.max_wall_time_per_ep is not None:
+        MAX_WALL_TIME_PER_EP = int(cli_args.max_wall_time_per_ep)
+    if cli_args.min_wall_time_per_ep is not None:
+        MIN_WALL_TIME_PER_EP = int(cli_args.min_wall_time_per_ep)
+
+    print("[Runner] Output root:", os.path.abspath(out_root), flush=True)
 
     # 客户端
     config = {"id": PLAN_ID, "config": RflysimEnvConfig(HOST, PORT_CMD, PORT_DATA)}
     client = VehicleClient(id=config["id"], config=config["config"])
     client.enable_rflysim()
 
-    manifest = {"plan_id": PLAN_ID, "episodes": []}
+    # 本进程自己的 manifest（避免并发写一个文件）
+    manifest = {"plan_id": PLAN_ID, "episodes": [], "pid": os.getpid()}
 
-    for ep in range(1, EPISODES + 1):
-        print(f"\n[Runner] ===== Episode {ep}/{EPISODES} =====", flush=True)
+    for local_ep in range(1, EPISODES + 1):
+        print(f"\n[Runner] ===== (local {local_ep}/{EPISODES}) =====", flush=True)
 
-        out_csv = os.path.join(out_root, f"ep_{ep:04d}.csv")
+        # ★ 从共享目录领取全局 ep 号（跨进程不重号）
+        global_ep = _alloc_next_ep_index(out_root)
+        out_csv = os.path.join(out_root, f"ep_{global_ep:04d}.csv")
+
         success, score = run_one_episode(
             client, PLAN_ID, out_csv,
             MAX_WALL_TIME_PER_EP, MIN_WALL_TIME_PER_EP
         )
 
         manifest["episodes"].append({
-            "episode": ep,
+            "global_ep": int(global_ep),
+            "local_ep": int(local_ep),
             "csv": os.path.abspath(out_csv),
             "success": bool(success),
             "score": score
         })
 
-        # 给后端 资源释放 缓冲（稍长一点更稳）
-        time.sleep(2.0 + random.uniform(0.0, 2.0))
+        # 给后端资源释放缓冲
+        time.sleep(10.0 + random.uniform(0.0, 2.0))
 
-    # 写索引文件
-    manifest_path = os.path.join(out_root, "manifest.json")
+    # 写“本进程自己的”清单，避免并发冲突（名字带 pid）
+    manifest_path = os.path.join(out_root, f"manifest_pid{os.getpid()}.json")
     with open(manifest_path, "w", encoding="utf-8") as f:
         json.dump(manifest, f, ensure_ascii=False, indent=2)
     print("[Runner] Manifest written to:", manifest_path, flush=True)
-    print("[Runner] Done. Total episodes:", EPISODES, flush=True)
+    print("[Runner] Done. Local episodes:", EPISODES, flush=True)
+
 
 if __name__ == "__main__":
     main()

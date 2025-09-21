@@ -424,7 +424,7 @@ class BCSeqPredictor64x16:
         self.device = _torch.device(device)
         self.h = None
         self.t0 = None
-        self.tspan = 300.0  # 在线未知总时长时，给个平滑的时间尺度
+        self.tspan = 500.0  # 在线未知总时长时，给个平滑的时间尺度
 
     def reset_episode(self, t0: float = 0.0, tspan_hint: float = None):
         self.h = None
